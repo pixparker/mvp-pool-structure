@@ -1,0 +1,25 @@
+{
+	email {$ACME_EMAIL}
+	admin 0.0.0.0:2019
+}
+
+# Self-hosted Docker registry, fronted with TLS + basic auth.
+# `mvpool-local` builds images and pushes here. The registry container itself
+# only listens on 127.0.0.1:5000; this is the only externally reachable path.
+registry.{$POOL_DOMAIN} {
+	encode gzip
+	basic_auth {
+		# Generated at bootstrap and bind-mounted to /etc/caddy/registry-auth/.
+		# Format: user $bcrypt-hash. Caddy reads inline; the htpasswd file is
+		# the source of truth for the password we hand to the operator.
+		import /etc/caddy/registry-auth/users.caddy
+	}
+	reverse_proxy registry:5000 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+}
+
+# Per-MVP site files live in /etc/caddy/sites/*.caddy (bind-mounted from ./sites).
+# `mvpool mvp:add` and `mvpool deploy` write/update these and trigger `caddy reload`.
+import /etc/caddy/sites/*.caddy

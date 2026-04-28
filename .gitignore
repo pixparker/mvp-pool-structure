@@ -1,0 +1,12 @@
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Generated at bootstrap / runtime; not committed
+deploy/infra/registry-auth/htpasswd
+deploy/infra/.env
+deploy/infra/sites/
+
+# Local operator state
+.mvpool-local/

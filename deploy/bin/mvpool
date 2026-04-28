@@ -1,0 +1,526 @@
+#!/usr/bin/env bash
+# mvpool — MVP-pool operations CLI. Runs on the server.
+#
+# Provider-agnostic. Needs: docker, docker compose, openssl, awk, jq.
+# Layout it assumes (created by bootstrap.sh):
+#   /srv/infra/            shared Caddy + Postgres + Redis + Registry (state side)
+#   /srv/infra/sites/      per-MVP Caddy snippets
+#   /srv/infra/state/      deployments.jsonl, etc.
+#   /srv/apps/<slug>/      per-MVP stack (compose.yaml, .env, .meta)
+#
+# The framework files (compose.yaml, Caddyfile, templates) live wherever the
+# repo was cloned (typically /opt/mvp-pool). `infra:install` symlinks them
+# into /srv/infra so `git pull` upgrades them in place; per-MVP files are
+# real files because they're rendered uniquely per slug.
+
+set -euo pipefail
+
+# ---------- paths + constants ---------------------------------------------
+SRV_ROOT="${SRV_ROOT:-/srv}"
+INFRA_DIR="$SRV_ROOT/infra"
+APPS_DIR="$SRV_ROOT/apps"
+SITES_DIR="$INFRA_DIR/sites"
+STATE_DIR="$INFRA_DIR/state"
+BACKUPS_DIR="$INFRA_DIR/backups"
+INFRA_COMPOSE="$INFRA_DIR/compose.yaml"
+INFRA_ENV="$INFRA_DIR/.env"
+DEPLOY_LOG="$STATE_DIR/deployments.jsonl"
+
+# FRAMEWORK_ROOT = the deploy/ folder this script lives in.
+FRAMEWORK_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# REPO_ROOT     = one level up from deploy/ (used for `self-update` git pull).
+REPO_ROOT="$(cd "$FRAMEWORK_ROOT/.." && pwd)"
+TEMPLATES_DIR="$FRAMEWORK_ROOT/templates"
+
+# ---------- style helpers -------------------------------------------------
+if [[ -t 1 ]]; then
+	C_BLUE=$'\033[1;34m'; C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'
+	C_RED=$'\033[1;31m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+else
+	C_BLUE=""; C_GREEN=""; C_YELLOW=""; C_RED=""; C_DIM=""; C_RESET=""
+fi
+log()  { printf '%s[mvpool]%s %s\n' "$C_BLUE" "$C_RESET" "$*"; }
+ok()   { printf '%s\xE2\x9C\x93%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[mvpool]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf '%s[mvpool]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+# ---------- shared helpers ------------------------------------------------
+require_infra() {
+	[[ -f "$INFRA_COMPOSE" && -f "$INFRA_ENV" ]] || die "infra not installed. Run: mvpool infra:install"
+}
+
+load_infra_env() {
+	# shellcheck disable=SC1090
+	[[ -f "$INFRA_ENV" ]] && { set -a; . "$INFRA_ENV"; set +a; } || die "no $INFRA_ENV"
+}
+
+load_mvp_meta() {
+	local slug="$1" meta="$APPS_DIR/$1/.meta"
+	[[ -f "$meta" ]] || die "MVP '$slug' not registered (expected $meta). Run: mvpool mvp:add"
+	# shellcheck disable=SC1090
+	set -a; . "$meta"; set +a
+}
+
+rand_b64() { openssl rand -base64 "${1:-32}" | tr -d '\n=/+' | cut -c1-"${1:-32}"; }
+
+render_template() {
+	# Replaces {{KEY}} placeholders. Pass KV pairs as KEY=VALUE.
+	local tpl="$1"; shift
+	local content; content=$(<"$tpl")
+	while (($#)); do
+		local key="${1%%=*}" val="${1#*=}"
+		content="${content//\{\{${key}\}\}/${val}}"
+		shift
+	done
+	printf '%s' "$content"
+}
+
+compose_mvp() {
+	# usage: compose_mvp <slug> <compose subcommand...>
+	local slug="$1"; shift
+	[[ -f "$APPS_DIR/$slug/compose.yaml" ]] || die "no compose.yaml for $slug"
+	docker compose \
+		--project-name "mvp-$slug" \
+		--project-directory "$APPS_DIR/$slug" \
+		-f "$APPS_DIR/$slug/compose.yaml" \
+		--env-file "$APPS_DIR/$slug/.env" \
+		"$@"
+}
+
+compose_infra() {
+	require_infra
+	docker compose --project-name mvpool-infra \
+		--project-directory "$INFRA_DIR" \
+		-f "$INFRA_COMPOSE" --env-file "$INFRA_ENV" "$@"
+}
+
+pg_admin_exec() {
+	require_infra
+	load_infra_env
+	docker compose --project-name mvpool-infra \
+		--project-directory "$INFRA_DIR" \
+		-f "$INFRA_COMPOSE" --env-file "$INFRA_ENV" \
+		exec -T -e PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" postgres \
+		psql -v ON_ERROR_STOP=1 -U "$POSTGRES_ADMIN_USER" -d postgres "$@"
+}
+
+append_deploy_log() {
+	# usage: append_deploy_log <slug> <tag> <mode>
+	mkdir -p "$STATE_DIR"
+	local slug="$1" tag="$2" mode="$3"
+	local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	printf '{"ts":"%s","slug":"%s","tag":"%s","mode":"%s"}\n' \
+		"$ts" "$slug" "$tag" "$mode" >> "$DEPLOY_LOG"
+}
+
+# ---------- subcommands: infra --------------------------------------------
+cmd_infra_install() {
+	# Wires /srv/infra so the infra compose can run from there while the
+	# compose.yaml/Caddyfile remain version-controlled in the framework dir.
+	need docker; need openssl
+	mkdir -p "$INFRA_DIR" "$SITES_DIR" "$BACKUPS_DIR" "$STATE_DIR" "$APPS_DIR"
+	# Symlink the compose+Caddyfile from the framework so `git pull` updates them in place.
+	ln -sfn "$FRAMEWORK_ROOT/infra/compose.yaml" "$INFRA_COMPOSE"
+	ln -sfn "$FRAMEWORK_ROOT/infra/Caddyfile"    "$INFRA_DIR/Caddyfile"
+	ln -sfn "$FRAMEWORK_ROOT/infra/registry-auth" "$INFRA_DIR/registry-auth"
+	if [[ ! -f "$INFRA_ENV" ]]; then
+		log "generating $INFRA_ENV"
+		cat > "$INFRA_ENV" <<EOF
+ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+POOL_DOMAIN=${POOL_DOMAIN:-example.com}
+POSTGRES_ADMIN_USER=mvpool_admin
+POSTGRES_ADMIN_PASSWORD=$(rand_b64 32)
+EOF
+		chmod 600 "$INFRA_ENV"
+		ok "wrote fresh admin credentials to $INFRA_ENV"
+		warn "edit $INFRA_ENV to set ACME_EMAIL and POOL_DOMAIN before running infra:up"
+	fi
+	touch "$SITES_DIR/.keep"
+	ok "infra installed at $INFRA_DIR"
+}
+
+cmd_infra_up()      { compose_infra up -d; ok "infra up"; }
+cmd_infra_down()    { compose_infra down; ok "infra down"; }
+cmd_infra_restart() { compose_infra restart; ok "infra restarted"; }
+cmd_infra_logs()    { compose_infra logs -f --tail=100 "$@"; }
+cmd_infra_ps()      { compose_infra ps; }
+cmd_infra_reload_caddy() {
+	# Caddy reloads config in-place without dropping TLS or connections.
+	compose_infra exec caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null
+	ok "caddy reloaded"
+}
+
+cmd_self_update() {
+	# Pull the latest framework code, then refresh infra.
+	# Safe to run on every git push to the pool repo.
+	need git
+	(cd "$REPO_ROOT" && git fetch --tags --prune && git pull --ff-only)
+	cmd_infra_install
+	cmd_infra_up
+	ok "self-update complete"
+}
+
+# ---------- subcommands: MVP lifecycle ------------------------------------
+allocate_redis_db() {
+	local used=""
+	for m in "$APPS_DIR"/*/.meta; do
+		[[ -f "$m" ]] || continue
+		used+=" $(grep -E '^REDIS_DB_INDEX=' "$m" | cut -d= -f2-)"
+	done
+	for i in $(seq 0 15); do
+		if [[ " $used " != *" $i "* ]]; then printf '%s' "$i"; return; fi
+	done
+	die "all 16 Redis DB indices are taken — switch to key-prefix isolation"
+}
+
+cmd_mvp_add() {
+	# mvpool mvp:add <slug> [--type T] [--domain D] [--no-db] [--no-redis]
+	#                       [--db-name N] [--db-user U] [--redis-db N]
+	# Defaults: type=react-node-monorepo, domain=<slug>.${POOL_DOMAIN}.
+	local slug="" type="react-node-monorepo" domain=""
+	local db_name="" db_user="" redis_db=""
+	local want_db=auto want_redis=auto
+
+	while (($#)); do
+		case "$1" in
+			--type) type="$2"; shift 2 ;;
+			--domain) domain="$2"; shift 2 ;;
+			--no-db) want_db=no; shift ;;
+			--no-redis) want_redis=no; shift ;;
+			--db-name) db_name="$2"; shift 2 ;;
+			--db-user) db_user="$2"; shift 2 ;;
+			--redis-db) redis_db="$2"; shift 2 ;;
+			-*) die "unknown flag: $1" ;;
+			*) [[ -z "$slug" ]] && slug="$1" || die "unexpected arg: $1"; shift ;;
+		esac
+	done
+	[[ -n "$slug" ]] || die "usage: mvpool mvp:add <slug> [--type T] [--domain D]"
+	[[ -d "$TEMPLATES_DIR/$type" ]] || die "unknown --type '$type' (have: $(ls "$TEMPLATES_DIR" | grep -v ^_ | tr '\n' ' '))"
+	require_infra
+	load_infra_env
+
+	# slug must be a safe DNS label.
+	[[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "slug must be lowercase alphanumeric/dash, <=41 chars"
+	[[ ! -d "$APPS_DIR/$slug" ]] || die "MVP '$slug' already exists at $APPS_DIR/$slug"
+
+	[[ -n "$domain" ]] || domain="${slug}.${POOL_DOMAIN}"
+	[[ -n "$db_name" ]] || db_name="${slug//-/_}"
+	[[ -n "$db_user" ]] || db_user="${slug//-/_}"
+
+	# DB / Redis are skipped for static; otherwise auto unless explicitly turned off.
+	[[ "$type" == "static" && "$want_db" == "auto" ]]    && want_db=no
+	[[ "$type" == "static" && "$want_redis" == "auto" ]] && want_redis=no
+	[[ "$want_db" == "auto" ]]    && want_db=yes
+	[[ "$want_redis" == "auto" ]] && want_redis=yes
+
+	local app_dir="$APPS_DIR/$slug"
+	mkdir -p "$app_dir/backups"
+
+	# 1. Postgres role + DB (if requested)
+	local db_pw=""
+	if [[ "$want_db" == "yes" ]]; then
+		log "creating Postgres role '$db_user' and database '$db_name'"
+		db_pw=$(rand_b64 32)
+		pg_admin_exec <<EOF
+CREATE ROLE "$db_user" WITH LOGIN PASSWORD '$db_pw';
+CREATE DATABASE "$db_name" OWNER "$db_user";
+REVOKE ALL ON DATABASE "$db_name" FROM PUBLIC;
+GRANT ALL PRIVILEGES ON DATABASE "$db_name" TO "$db_user";
+EOF
+	fi
+
+	# 2. Redis DB index (if requested)
+	if [[ "$want_redis" == "yes" && -z "$redis_db" ]]; then
+		redis_db=$(allocate_redis_db)
+	fi
+
+	# 3. Render the per-MVP compose.yaml from the template.
+	render_template "$TEMPLATES_DIR/$type/compose.yaml.tpl" \
+		"SLUG=$slug" \
+		> "$app_dir/compose.yaml"
+
+	# 4. Render .env. Common section first; API extras only if the template uses them.
+	local registry_host="registry.${POOL_DOMAIN}"
+	render_template "$TEMPLATES_DIR/_shared/env.common.tpl" \
+		"SLUG=$slug" "DOMAIN=$domain" \
+		"REGISTRY=$registry_host" "IMAGE_TAG=bootstrap" \
+		> "$app_dir/.env"
+	if [[ "$type" != "static" ]]; then
+		local jwt_a jwt_r secenc
+		jwt_a=$(rand_b64 48); jwt_r=$(rand_b64 48); secenc=$(rand_b64 48)
+		render_template "$TEMPLATES_DIR/_shared/env.api.tpl" \
+			"DOMAIN=$domain" \
+			"DB_USER=$db_user" "DB_PASSWORD=$db_pw" "DB_NAME=$db_name" \
+			"REDIS_DB_INDEX=${redis_db:-0}" \
+			"JWT_ACCESS_SECRET=$jwt_a" "JWT_REFRESH_SECRET=$jwt_r" \
+			"SECRETS_ENCRYPTION_KEY=$secenc" \
+			>> "$app_dir/.env"
+	fi
+	chmod 600 "$app_dir/.env"
+
+	# 5. Write meta.
+	cat > "$app_dir/.meta" <<EOF
+SLUG=$slug
+TYPE=$type
+DOMAIN=$domain
+DB_NAME=${db_name}
+DB_USER=${db_user}
+REDIS_DB_INDEX=${redis_db:-}
+HAS_DB=$want_db
+HAS_REDIS=$want_redis
+CURRENT_TAG=
+EOF
+	chmod 600 "$app_dir/.meta"
+
+	# 6. Caddy site snippet. Static MVPs use the static-only template (no /api/* route).
+	if [[ "$type" == "static" ]]; then
+		render_template "$TEMPLATES_DIR/_shared/caddy-site.static.tpl" \
+			"DOMAIN=$domain" \
+			"WEB_HOST=mvp-${slug}-web-1" \
+			> "$SITES_DIR/$slug.caddy"
+	else
+		render_template "$TEMPLATES_DIR/_shared/caddy-site.api-web.tpl" \
+			"DOMAIN=$domain" \
+			"API_HOST=mvp-${slug}-api-1" "API_PORT=4000" \
+			"WEB_HOST=mvp-${slug}-web-1" "WEB_PORT=80" \
+			> "$SITES_DIR/$slug.caddy"
+	fi
+
+	ok "MVP '$slug' registered."
+	echo "  type:         $type"
+	echo "  domain:       $domain"
+	[[ "$want_db" == "yes" ]]    && echo "  database:     $db_name (user $db_user)"
+	[[ "$want_redis" == "yes" ]] && echo "  redis db:     $redis_db"
+	echo
+	echo "Next: build and push from your laptop, e.g."
+	echo "  mvpool-local deploy $slug --from /path/to/source"
+}
+
+cmd_mvp_list() {
+	printf '%-20s %-25s %-40s %-12s %-15s\n' SLUG TYPE DOMAIN CURRENT_TAG DB_NAME
+	for m in "$APPS_DIR"/*/.meta; do
+		[[ -f "$m" ]] || continue
+		# shellcheck disable=SC1090
+		( set -a; . "$m"; set +a
+		  printf '%-20s %-25s %-40s %-12s %-15s\n' "$SLUG" "$TYPE" "$DOMAIN" "${CURRENT_TAG:--}" "${DB_NAME:--}" )
+	done
+}
+
+cmd_mvp_remove() {
+	local slug="${1:-}"; [[ -n "$slug" ]] || die "usage: mvpool mvp:remove <slug> --yes"
+	local app_dir="$APPS_DIR/$slug"
+	[[ -d "$app_dir" ]] || die "no such MVP: $slug"
+	[[ "${2:-}" == "--yes" ]] || die "refusing: re-run with --yes to confirm destructive removal"
+	load_mvp_meta "$slug"
+
+	log "stopping stack"
+	compose_mvp "$slug" down --remove-orphans || true
+
+	log "removing Caddy site"
+	rm -f "$SITES_DIR/$slug.caddy"
+	cmd_infra_reload_caddy || true
+
+	if [[ "${HAS_DB:-no}" == "yes" ]]; then
+		log "backing up database to $BACKUPS_DIR/${DB_NAME}-removed-$(date +%Y%m%d-%H%M%S).sql.gz"
+		cmd_db_backup "$slug" || warn "db backup failed; continuing"
+		log "dropping database + role"
+		pg_admin_exec <<EOF
+DROP DATABASE IF EXISTS "$DB_NAME";
+DROP ROLE IF EXISTS "$DB_USER";
+EOF
+	fi
+
+	log "removing $app_dir"
+	rm -rf "$app_dir"
+	ok "MVP '$slug' removed."
+}
+
+# ---------- subcommands: deploy + runtime ---------------------------------
+update_env_var() {
+	# usage: update_env_var <file> <KEY> <VALUE>
+	local f="$1" key="$2" val="$3"
+	if grep -q "^${key}=" "$f"; then
+		# Use a different sed delimiter to allow / in values.
+		sed -i.bak "s|^${key}=.*|${key}=${val}|" "$f" && rm -f "${f}.bak"
+	else
+		printf '%s=%s\n' "$key" "$val" >> "$f"
+	fi
+}
+
+cmd_deploy() {
+	# mvpool deploy <slug> --tag <tag> [--mode registry|tarball]
+	# `--mode` is informational here (the actual transfer happened on the
+	# laptop side); we record it in the deploy log for audit.
+	local slug="" tag="" mode="registry"
+	while (($#)); do
+		case "$1" in
+			--tag) tag="$2"; shift 2 ;;
+			--mode) mode="$2"; shift 2 ;;
+			-*) die "unknown flag: $1" ;;
+			*) [[ -z "$slug" ]] && slug="$1" || die "unexpected arg: $1"; shift ;;
+		esac
+	done
+	[[ -n "$slug" && -n "$tag" ]] || die "usage: mvpool deploy <slug> --tag <tag> [--mode registry|tarball]"
+	load_mvp_meta "$slug"
+	local app_dir="$APPS_DIR/$slug"
+
+	log "$slug: setting IMAGE_TAG=$tag"
+	update_env_var "$app_dir/.env" IMAGE_TAG "$tag"
+
+	if [[ "$mode" == "registry" ]]; then
+		log "$slug: pulling images"
+		compose_mvp "$slug" pull
+	else
+		log "$slug: tarball mode — assuming images are already loaded locally"
+	fi
+
+	log "$slug: starting services"
+	compose_mvp "$slug" up -d --remove-orphans
+
+	log "$slug: reloading shared Caddy"
+	cmd_infra_reload_caddy || true
+
+	update_env_var "$app_dir/.meta" CURRENT_TAG "$tag"
+	append_deploy_log "$slug" "$tag" "$mode"
+
+	ok "$slug deployed @ $tag  →  https://$DOMAIN"
+}
+
+cmd_rollback() {
+	# mvpool rollback <slug> <tag>
+	local slug="${1:-}" tag="${2:-}"
+	[[ -n "$slug" && -n "$tag" ]] || die "usage: mvpool rollback <slug> <tag>"
+	cmd_deploy "$slug" --tag "$tag"
+}
+
+cmd_logs() {
+	local slug="${1:-}"; shift || true
+	[[ -n "$slug" ]] || die "usage: mvpool logs <slug> [service]"
+	compose_mvp "$slug" logs -f --tail=200 "$@"
+}
+
+cmd_ps() {
+	local slug="${1:-}"; [[ -n "$slug" ]] || die "usage: mvpool ps <slug>"
+	compose_mvp "$slug" ps
+}
+
+cmd_restart() {
+	local slug="${1:-}"; shift || true
+	[[ -n "$slug" ]] || die "usage: mvpool restart <slug> [service]"
+	compose_mvp "$slug" restart "$@"; ok "restarted"
+}
+cmd_stop()  { local s="${1:?usage: mvpool stop <slug>}";  compose_mvp "$s" stop;  ok "stopped $s"; }
+cmd_start() { local s="${1:?usage: mvpool start <slug>}"; compose_mvp "$s" start; ok "started $s"; }
+
+# ---------- subcommands: db -----------------------------------------------
+cmd_db_psql() {
+	local slug="${1:-}"; [[ -n "$slug" ]] || die "usage: mvpool db:psql <slug>"
+	load_mvp_meta "$slug"; load_infra_env
+	[[ "${HAS_DB:-no}" == "yes" ]] || die "$slug has no database"
+	compose_infra exec -e PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" postgres \
+		psql -U "$POSTGRES_ADMIN_USER" -d "$DB_NAME"
+}
+
+cmd_db_backup() {
+	local slug="${1:-}"; [[ -n "$slug" ]] || die "usage: mvpool db:backup <slug>"
+	load_mvp_meta "$slug"; load_infra_env
+	[[ "${HAS_DB:-no}" == "yes" ]] || die "$slug has no database"
+	local out="$APPS_DIR/$slug/backups/${DB_NAME}-$(date +%Y%m%d-%H%M%S).sql.gz"
+	mkdir -p "$(dirname "$out")"
+	compose_infra exec -T -e PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" postgres \
+		pg_dump --clean --if-exists -U "$POSTGRES_ADMIN_USER" "$DB_NAME" | gzip > "$out"
+	ok "backup -> $out ($(du -h "$out" | cut -f1))"
+}
+
+cmd_db_restore() {
+	local slug="${1:-}" file="${2:-}"
+	[[ -n "$slug" && -n "$file" && -f "$file" ]] || die "usage: mvpool db:restore <slug> <path-to-.sql(.gz)>"
+	load_mvp_meta "$slug"; load_infra_env
+	[[ "${HAS_DB:-no}" == "yes" ]] || die "$slug has no database"
+	local reader="cat"; [[ "$file" == *.gz ]] && reader="gzip -dc"
+	$reader "$file" | compose_infra exec -T -e PGPASSWORD="$POSTGRES_ADMIN_PASSWORD" postgres \
+		psql -U "$POSTGRES_ADMIN_USER" -d "$DB_NAME"
+	ok "restored $file -> $DB_NAME"
+}
+
+# ---------- subcommands: status -------------------------------------------
+cmd_status() {
+	echo "=== infra ===";    compose_infra ps 2>/dev/null || echo "(infra not up)"
+	echo; echo "=== MVPs ==="; cmd_mvp_list
+	echo; echo "=== last 10 deploys ==="
+	[[ -f "$DEPLOY_LOG" ]] && tail -n 10 "$DEPLOY_LOG" || echo "(no deploys yet)"
+	echo; echo "=== disk ==="; df -h /srv 2>/dev/null || true
+}
+
+# ---------- dispatch ------------------------------------------------------
+usage() {
+	cat <<'EOF'
+mvpool — MVP-pool ops CLI
+
+Infra:
+  bootstrap                                        run server-level bootstrap (sudo)
+  infra:install                                    wire /srv/infra and gen .env
+  infra:up | infra:down | infra:restart | infra:ps
+  infra:logs [service]
+  infra:reload-caddy                               reload Caddy without downtime
+  self-update                                      git pull + infra:up -d (re-applies infra changes)
+
+MVP lifecycle:
+  mvp:add <slug> [--type T] [--domain D] [--no-db] [--no-redis]
+                 [--db-name N] [--db-user U] [--redis-db N]
+                 type ∈ static | node-server | react-node-monorepo | full-stack-queue
+                 default domain: <slug>.${POOL_DOMAIN}
+  mvp:list
+  mvp:remove <slug> --yes                          stops, backs up DB, drops DB+role
+
+Deploy / runtime:
+  deploy <slug> --tag <tag> [--mode registry|tarball]
+                                                   pull images, restart services, log it
+  rollback <slug> <tag>                            shorthand for `deploy <slug> --tag <tag>`
+  logs <slug> [service]
+  ps <slug>
+  restart <slug> [service]  |  stop <slug>  |  start <slug>
+
+Database (only for MVPs with --type != static):
+  db:psql <slug>
+  db:backup <slug>
+  db:restore <slug> <path>
+
+Overview:
+  status                                           infra + MVPs + recent deploys + disk
+EOF
+}
+
+main() {
+	local sub="${1:-}"; shift || true
+	case "$sub" in
+		bootstrap)        exec sudo bash "$FRAMEWORK_ROOT/bootstrap.sh" "$@" ;;
+		infra:install)    cmd_infra_install "$@" ;;
+		infra:up)         cmd_infra_up "$@" ;;
+		infra:down)       cmd_infra_down "$@" ;;
+		infra:restart)    cmd_infra_restart "$@" ;;
+		infra:logs)       cmd_infra_logs "$@" ;;
+		infra:ps)         cmd_infra_ps "$@" ;;
+		infra:reload-caddy) cmd_infra_reload_caddy "$@" ;;
+		self-update)      cmd_self_update "$@" ;;
+		mvp:add)          cmd_mvp_add "$@" ;;
+		mvp:list|list)    cmd_mvp_list "$@" ;;
+		mvp:remove)       cmd_mvp_remove "$@" ;;
+		deploy)           cmd_deploy "$@" ;;
+		rollback)         cmd_rollback "$@" ;;
+		logs)             cmd_logs "$@" ;;
+		ps)               cmd_ps "$@" ;;
+		restart)          cmd_restart "$@" ;;
+		stop)             cmd_stop "$@" ;;
+		start)            cmd_start "$@" ;;
+		db:psql)          cmd_db_psql "$@" ;;
+		db:backup)        cmd_db_backup "$@" ;;
+		db:restore)       cmd_db_restore "$@" ;;
+		status)           cmd_status "$@" ;;
+		""|-h|--help|help) usage ;;
+		*) die "unknown subcommand: $sub (try: mvpool help)" ;;
+	esac
+}
+
+main "$@"
