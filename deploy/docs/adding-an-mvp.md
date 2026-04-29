@@ -2,6 +2,81 @@
 
 End-to-end, from "I have a project" to "it's live at `<slug>.${POOL_DOMAIN}`".
 
+## 0. Recommended project layout (the "site/ + scripts" convention)
+
+Every project that lives in this pool should colocate its deploy wrappers next to whatever it deploys. The pattern is:
+
+```
+your-project/
+├── <subproject>/                 ← one folder per deployable thing
+│   ├── site/                     ← static content (for --type static)
+│   │   ├── *.html
+│   │   └── assets/
+│   ├── deploy.sh                 ← thin wrapper around `mvpool-local deploy`
+│   ├── register.sh               ← one-time `mvpool-local mvp:add` wrapper
+│   └── README.md                 ← deploy notes specific to this subproject
+└── <other-subproject>/           ← parallel structure if there's more than one
+    └── ...
+```
+
+Why **`site/` instead of putting HTML at the subproject root**:
+- `mvpool-local deploy --static-root <subproject>/site` only copies `site/` into the image. **`deploy.sh` and `register.sh` stay at the subproject root**, so they're never accidentally served at `https://<host>/deploy.sh` (which would leak ops scripts to visitors).
+- Same shape works whether your subproject has one HTML file or fifty — no ad-hoc decisions about what's content vs tooling.
+- `git mv` later is easy: a new subproject is just `cp -R <existing> <new>` and edit the slug.
+
+For non-static templates (`node-server`, `react-node-monorepo`, `full-stack-queue`), the subproject is your usual repo (a `Dockerfile`, `package.json`, etc.) and `deploy.sh` lives at its root — same `cd $PROJECT_ROOT && mvpool-local deploy ...` pattern, but `--from .` and no `--static-root`.
+
+### Real example: `gamification-faraward`
+
+Two parallel subprojects in one repo, sharing infrastructure (the gamification design prototype + a coming-soon landing for the same brand):
+
+```
+gamification-faraward/
+├── prototype/                    # design prototype → demo-faraward.pagio.ir
+│   ├── site/
+│   │   ├── *.html
+│   │   └── assets/
+│   ├── deploy.sh                 # ./prototype/deploy.sh
+│   ├── register.sh
+│   └── README.md
+└── startup/                      # coming-soon landing → farawand.ir
+    ├── site/
+    │   └── index.html
+    ├── deploy.sh                 # ./startup/deploy.sh
+    └── register.sh
+```
+
+### Sample wrapper scripts
+
+`<subproject>/deploy.sh`:
+
+```bash
+#!/usr/bin/env bash
+# Build and ship this subproject. Default --mode tarball is appropriate
+# for restricted-network pools (e.g. Iran-hosted); override with --mode
+# registry on a non-restricted pool.
+set -euo pipefail
+PROJECT_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$PROJECT_ROOT"
+exec mvpool-local deploy <slug> \
+    --from . \
+    --type static \
+    --static-root <subproject>/site \
+    --mode tarball \
+    "$@"
+```
+
+`<subproject>/register.sh`:
+
+```bash
+#!/usr/bin/env bash
+# One-time: register this subproject on the pool server.
+set -euo pipefail
+exec mvpool-local mvp:add <slug> --type static --domain <hostname-or-omit> "$@"
+```
+
+(Replace `<slug>`, `<subproject>`, and `<hostname-or-omit>` with the actual values for each subproject. Make both scripts executable: `chmod +x deploy.sh register.sh`.)
+
 ## 1. Pick a template type
 
 | Your project shape                                 | `--type`                |
@@ -50,12 +125,14 @@ Per template type, `mvpool-local deploy` does this:
 ```bash
 mvpool deploy gamification \
   --from /path/to/repo \
-  --static-root prototype/
+  --static-root prototype/site
 ```
 
-- Materialises a temp build context with the framework's `Dockerfile` + `nginx.conf` + your `prototype/` folder.
-- Builds `<registry>/<slug>-web:<sha>`, pushes (or `docker save | ssh load`).
+- Materialises a temp build context with the framework's `Dockerfile` + `nginx.conf` + your `<subproject>/site/` folder.
+- Builds `<registry>/<slug>-web:<sha>`, pushes (or `docker save | ssh load` in tarball mode).
 - Server pulls and starts.
+
+> Static content lives in `<subproject>/site/` (not `<subproject>/` directly) so `deploy.sh` / `register.sh` at the subproject root don't get baked into the served image. See [layout convention](#0-recommended-project-layout-the-site--scripts-convention).
 
 ### `--type node-server`
 
