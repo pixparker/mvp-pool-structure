@@ -151,3 +151,141 @@ If outbound network restrictions ease in the future (or the VPS is migrated to a
 3. Run `mvpool infra:up` to start the registry container.
 4. Re-add Caddy auto-HTTPS by removing `http://` prefixes from per-MVP site files.
 5. From laptop: `mvpool-local login` and switch from `--mode tarball` to default registry deploys.
+
+---
+
+## Field findings — Iran VPS bring-up, 2026-04-28/29
+
+Concrete issues hit during the first real Iran deployment, with their root cause and fix. Skim before bringing up a new Iran VPS — most of these are cheaper to dodge than to debug live.
+
+### 1. SSH sessions drop mid-command via the public hostname
+
+**Symptom:** `ssh user@<hostname>` works for short commands, drops `Connection closed by 198.18.0.x port 22` for anything that runs more than a few seconds. The IP `198.18.0.x` is in RFC 6890 TEST-NET-1, which Shadowrocket and similar Mac proxies use as **fakedns**.
+
+**Root cause:** The local proxy intercepts DNS for the hostname (even with a "bypass" rule), routes the SSH session through itself, and kills idle/long-lived TCP.
+
+**Fix:** Use a direct-IP SSH alias plus `ControlMaster` for connection multiplexing. Sample `~/.ssh/config`:
+```
+Host pagio
+    HostName 94.182.93.28
+    User root
+    ServerAliveInterval 15
+    ServerAliveCountMax 8
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+For long-running server-side tasks (apt install, docker pulls), wrap them in `setsid nohup ... > /var/log/foo.log 2>&1 &` and poll the log file via short SSH commands. SSH drops then don't kill the work.
+
+### 2. apt-get update fails — even over HTTPS
+
+**Symptom:** `apt-get update` fails with mixed errors: `Connection failed [IP: ... 80]` (HTTP/80 outright blocked) AND `Could not handshake: Error in the pull function` (TLS DPI'd to specific hosts) AND `Temporary failure resolving 'archive.ubuntu.com'` (DNS censorship).
+
+**Root cause:** Iran blocks outbound port 80 entirely; HTTPS/443 to Canonical's archive hosts gets TLS-fingerprint-blocked by DPI. Some package mirrors are also DNS-censored.
+
+**Fix:** Don't try to install via apt on the server. Use the static Docker tarball + the `download/install-bundle.sh` flow. **No apt activity required on the server at all.** Static binaries cover dockerd, docker CLI, containerd, runc, ctr, docker-init, docker-proxy. The compose plugin is a separate single binary.
+
+### 3. Docker Desktop's "Manual proxy" config silently overridden
+
+**Symptom:** You set `Docker Desktop → Settings → Resources → Proxies → Manual proxy: http://host.docker.internal:1082`, click Apply & Restart. `docker info` *still* shows `HTTP Proxy: http.docker.internal:3128` (Docker Desktop's built-in cache proxy). `docker pull ubuntu:24.04` fails with `Bad Request` or `EOF` from `registry-1.docker.io`.
+
+**Root cause:** Docker Desktop's `http.docker.internal:3128` is its built-in Hub Cache. It's auto-configured and overrides user-set proxy settings unless explicitly disabled.
+
+**Fix that worked:** Skip Docker Desktop for image pulls. Use `crane` (single static binary from `github.com/google/go-containerregistry/releases`) which goes through the laptop's transparent proxy correctly. With retries, mid-sized images (~50 MB compressed) succeed within 1–3 attempts.
+
+### 4. `crane pull` drops mid-blob (~15–25 MB transferred)
+
+**Symptom:** `crane pull caddy:2-alpine /tmp/caddy.tar` fails partway with `unexpected EOF` after ~20 MB. Tiny images (alpine, 3 MB) pull fine; mid-sized images fail.
+
+**Root cause:** Iran's network has aggressive idle-timeout and rate-limit at the TCP layer (or DPI throttles long TLS sessions to specific destinations). Single-shot pulls of any non-trivial size hit it.
+
+**Fix:** Wrap `crane pull` in a retry loop (5–10 attempts). Each retry restarts from scratch; eventually one full transfer slips through.
+
+### 5. Cloudflare orange-cloud is wrong for Iran-to-Iran traffic
+
+**Symptom:** Origin works server-side. Orange-cloud the hostname → browser/curl in Iran fails with `ERR_CONNECTION_CLOSED` / `SSL_ERROR_SYSCALL`. Visitors abroad see the site fine.
+
+**Root cause:** With orange-cloud, DNS resolves to CF anycast (`104.x` / `188.x`). Iran's DPI blocks the laptop→CF TLS handshake. Even a Shadowrocket-bypass rule for the apex domain doesn't help because Shadowrocket still routes the TCP through itself, then encounters the same DPI on the way out via the bypass path.
+
+**Fix:** For pools with **Iran-resident audiences**, do NOT use Cloudflare in front. Use either grey-cloud direct-to-origin (if HTTP-only is acceptable) or an Iran-based CDN like ArvanCloud. See the [ArvanCloud migration runbook](#arvancloud-migration-recommended-for-iran-audiences) below.
+
+### 6. CF DNS lookups intermittently fail from Iran ISPs
+
+**Symptom:** With Shadowrocket OFF on the operator's laptop, `dig demo-faraward.pagio.ir` may not resolve. Real Iran visitors (no VPN) report "site not found" / DNS failure, not just connection failure.
+
+**Root cause:** Cloudflare's authoritative nameservers (`*.ns.cloudflare.com`) are on CF anycast IPs that are partially blocked from Iran. Iran ISP recursive resolvers can't reliably reach them.
+
+**Fix:** Move DNS hosting to an Iran-based provider (ArvanCloud, Hostiran). The zone records stay the same; only the NS records at the registrar change. Visitors' Iran ISPs reach the new nameservers reliably because they're inside Iran's network.
+
+### 7. Bare HTTP `Host`-header URL filtering is intermittent, not deterministic
+
+**Symptom:** `/dashboard.html`, `/login.html`, `/kpi.html` returned `Empty reply from server` from the operator's laptop while `/games.html`, `/landing.html`, `/wizard.html` worked. Looked like keyword DPI. Different runs failed *different* paths.
+
+**Root cause:** Not URL-keyword filtering — random TCP drops under DPI/connection-tracker rate limits. The cleartext HTTP path triggers more aggressive throttling than HTTPS would.
+
+**Fix:** Get TLS at origin (or at an Iran CDN edge in front). HTTPS hides the URL path from DPI and reduces the connection-level interference. Until then, treat any one failed request as flake; retry once.
+
+### 8. rsync of a directory drops mid-tree; per-file scp is more robust
+
+**Symptom:** Single `rsync -av source/ host:dest/` fails partway with `Connection closed by ... port 22` after ~150 MB. `--partial` keeps work but the next rsync attempt sometimes resumes incorrectly under macOS BSD rsync. `--append-verify` not supported in BSD rsync.
+
+**Fix:** For large bundle transfers, loop per-file scp with explicit size verification:
+```bash
+for f in big-files/*; do
+  for try in 1 2 3 4 5; do
+    scp "$f" pagio:dest/ 2>&1
+    [ "$(ssh pagio "stat -c %s dest/$(basename "$f")")" = "$(stat -f %z "$f")" ] && break
+  done
+done
+```
+
+### 9. Compose `infra:up` pulls services it doesn't need on a static-only pool
+
+**Symptom:** First `mvpool infra:up` on a static-only pool tries to `docker pull postgres:16-alpine` and `redis:7-alpine` and hangs / fails because those images aren't in the offline bundle.
+
+**Fix (now in framework):** `infra/compose.yaml` gates postgres, redis, registry behind compose `profiles: ["data"]` / `profiles: ["registry"]`. Default `mvpool infra:up` starts Caddy alone. Bring data services up explicitly only when an MVP needs them.
+
+### 10. Browser shows ERR_CONNECTION_CLOSED on a working origin
+
+**Symptom:** `curl http://<host>/` from server returns 200; from operator's browser, browser shows `ERR_CONNECTION_CLOSED`.
+
+**Root cause:** Combination of Shadowrocket's fakedns intercepting the hostname, the bypass-rule routing the connection back through Iran's network, and DPI dropping the connection at the syscall layer. The origin is fine; the path from this specific browser is the problem.
+
+**Diagnosis quick-test:** Curl the origin **by IP with `-H "Host: <hostname>"`**. If that returns 200, the deploy is good — the issue is Shadowrocket / Iran-network intermittence, not your stack.
+
+---
+
+## ArvanCloud migration (recommended for Iran audiences)
+
+When the pool's visitors are in Iran, host DNS (and ideally TLS-CDN) inside Iran. ArvanCloud is the obvious choice — Cloudflare-equivalent product, infrastructure inside Iran, free tier sufficient for prototype/early-stage MVPs.
+
+### What you get
+
+- **DNS** hosted in Iran → reliable resolution from Iran ISPs, no VPN needed for visitors.
+- **CDN with TLS at the edge** (optional) → real public TLS cert visible in the browser (lock icon), Iran-to-Iran routing throughout. Free tier covers small/medium prototype traffic.
+- **Caching, basic DDoS protection** as bonus.
+
+### Migration steps (per zone, ~15 min + DNS propagation)
+
+1. **Sign up for ArvanCloud** at <https://panel.arvancloud.ir>. Verification needs an Iranian phone number.
+2. **Add the zone** (`pagio.ir` or `farawand.ir`) in ArvanCloud panel → CDN → Domains. ArvanCloud will start a DNS scan to import existing records.
+3. **Verify imported records.** Check the A records, MX, TXT, CNAMEs. Add anything missing (compare against the current Cloudflare zone).
+4. **Decide CDN proxy per record.** For each subdomain like `demo-faraward`:
+    - **DNS-only (cloud OFF)** — visitor connects directly to your origin. HTTP only (no TLS at origin in our current setup).
+    - **Cloud ON** — ArvanCloud terminates TLS at the edge using a real public cert; origin can stay HTTP. **Recommended.** Same model as Cloudflare orange-cloud, but inside Iran.
+5. **Get the ArvanCloud nameservers** from the panel — they look like `ns1.arvancdn.ir`, `ns2.arvancdn.ir`.
+6. **Update NS records at your domain registrar.** For `.ir` domains this is the IRNIC panel (or your registrar's portal). Replace the current Cloudflare nameservers with ArvanCloud's. Save.
+7. **Wait for NS propagation** (1–24 hr typical, often <1 hr). Test with `dig +trace pagio.ir` from outside; once the trace ends at ArvanCloud's NS, you're switched.
+8. **Once stable**, you can leave the Cloudflare zone in CF as a no-op (NS records at registrar overrule it) or delete the CF zone.
+
+### Things to know before flipping
+
+- **DNS TTL during migration:** lower CF TTLs to 5 min ~24 hr **before** the NS switch so Iran ISP caches expire quickly.
+- **Email records (MX, SPF, DKIM):** make sure they're identically populated in ArvanCloud before flipping NS. Otherwise outbound mail breaks during propagation.
+- **Per-MVP Caddy site files:** if ArvanCloud Cloud is ON for the site (Flexible-equivalent mode), keep Caddy site files as `http://<host>` — origin serves HTTP, ArvanCloud handles edge TLS. If Cloud is OFF, the visitor hits origin directly and you'll want a real cert at origin or accept HTTP-only.
+- **The framework is agnostic** to which DNS host you use. `mvpool` and per-MVP compose don't care; only the per-MVP Caddy site file (and `POOL_DOMAIN` in `/srv/infra/.env`) reference the hostname.
+
+### After migration
+
+Update `deploy/docs/operations.md` Cloudflare references where appropriate. For Iran-pool VPSes, the recommended default becomes **ArvanCloud DNS + Cloud ON**. Cloudflare remains a fine option for non-Iran pools.
