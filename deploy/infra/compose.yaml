@@ -43,8 +43,13 @@ services:
       timeout: 3s
       retries: 3
 
+  # Postgres + Redis are gated behind the `data` profile so static-only
+  # pools don't fail trying to pull/start them. Bring them up explicitly
+  # via `docker compose --profile data up -d` (or `mvpool infra:up --with-data`)
+  # when the first MVP that needs them is registered.
   postgres:
     image: postgres:16-alpine
+    profiles: ["data"]
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_ADMIN_USER:?set POSTGRES_ADMIN_USER}
@@ -69,6 +74,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    profiles: ["data"]
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000", "--maxmemory-policy", "noeviction"]
     volumes:
@@ -87,8 +93,12 @@ services:
   # Caddy fronts it at registry.${POOL_DOMAIN} with auto TLS + basic auth.
   # The registry itself only listens on 127.0.0.1 — Caddy is the only reachable
   # entry point, and it requires the htpasswd-authenticated user to pass through.
+  # Gated behind the `registry` profile: opt-in via `mvpool infra:up --with-registry`
+  # (or `docker compose --profile registry up -d`). Restricted-network pools
+  # typically skip this and use tarball-mode deploys instead.
   registry:
     image: registry:2
+    profiles: ["registry"]
     restart: unless-stopped
     environment:
       REGISTRY_STORAGE_DELETE_ENABLED: "true"

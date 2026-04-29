@@ -10,3 +10,10 @@ deploy/infra/sites/
 
 # Local operator state
 .mvpool-local/
+
+# Offline bundle artifacts (regenerate via download/refresh.sh — do NOT commit)
+download/debs/
+download/images/
+download/docker/
+download/tools/
+download/*.crdownload
