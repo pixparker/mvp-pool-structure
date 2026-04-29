@@ -286,6 +286,27 @@ When the pool's visitors are in Iran, host DNS (and ideally TLS-CDN) inside Iran
 - **Per-MVP Caddy site files:** if ArvanCloud Cloud is ON for the site (Flexible-equivalent mode), keep Caddy site files as `http://<host>` — origin serves HTTP, ArvanCloud handles edge TLS. If Cloud is OFF, the visitor hits origin directly and you'll want a real cert at origin or accept HTTP-only.
 - **The framework is agnostic** to which DNS host you use. `mvpool` and per-MVP compose don't care; only the per-MVP Caddy site file (and `POOL_DOMAIN` in `/srv/infra/.env`) reference the hostname.
 
+### Field findings — pagio.ir on ArvanCloud (2026-04-29)
+
+Items learned during the actual migration. Worth knowing before the next zone:
+
+11. **Free tier doesn't allow proxied wildcards.** A `*` A record on ArvanCloud's free plan is forced to "DNS only" — you cannot turn the cloud icon on for it. **Implication:** every MVP that should be CDN-proxied (TLS, caching) needs its own specific A record in the panel. The framework's `mvpool mvp:add` should create the record per-MVP (manually in the panel for now, or via the ArvanCloud API once we wire it up). For a small pool with 5–10 MVPs this is an annoyance, not a blocker.
+
+12. **The wildcard is still useful as a fallback.** Add `*` A → origin IP, DNS-only. Future subdomains that haven't been registered specifically still resolve and reach the origin (cleartext HTTP, no TLS at edge for them). Specific records take precedence and get the proxy benefits.
+
+13. **NS records for ArvanCloud:** `v.ns.arvancdn.ir` + `e.ns.arvancdn.ir`. Set both at the registrar (IRNIC for `.ir` domains).
+
+14. **`ssh.<pool-domain>` should always stay DNS-only.** No reason to route SSH through a CDN; the CDN doesn't even handle non-HTTP protocols. Keep that record proxy-off.
+
+15. **Per-MVP record naming convention.** Standardize on `<slug>` as the record name (i.e. `demo-faraward` for `demo-faraward.pagio.ir`). The framework's templates already match `<slug>.${POOL_DOMAIN}`, so the panel just needs the slug.
+
+16. **Expected ArvanCloud free-plan limits to watch for** (from public docs): traffic cap per month (typically a few hundred GB on free tier), no custom SSL upload, basic-tier WAF only. Plenty for a prototype/early-MVP pool. Upgrade plan (or hop to a different Iran CDN) when traffic outgrows it.
+
 ### After migration
 
-Update `deploy/docs/operations.md` Cloudflare references where appropriate. For Iran-pool VPSes, the recommended default becomes **ArvanCloud DNS + Cloud ON**. Cloudflare remains a fine option for non-Iran pools.
+Update `deploy/docs/operations.md` Cloudflare references where appropriate. For Iran-pool VPSes, the recommended default becomes **ArvanCloud DNS + Cloud ON per record**. Cloudflare remains a fine option for non-Iran pools.
+
+### Pending framework work (P2)
+
+- **`mvpool mvp:add` should create the ArvanCloud DNS record automatically** when an `ARVANCLOUD_API_TOKEN` is in `/srv/infra/.env`. Mirrors the same pattern we'd want for Cloudflare. Eliminates the per-MVP manual panel step.
+- **Document the wildcard fallback explicitly** in `deploy/docs/adding-an-mvp.md` so operators know that `<new-slug>.<pool-domain>` resolves out of the box for HTTP-only access, even if they forgot to add the specific proxied record.
