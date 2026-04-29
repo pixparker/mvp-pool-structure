@@ -140,7 +140,23 @@ EOF
 	ok "infra installed at $INFRA_DIR"
 }
 
-cmd_infra_up()      { compose_infra up -d; ok "infra up"; }
+cmd_infra_up() {
+	# infra:up [--with-data] [--with-registry] [--with-all]
+	# Caddy is always brought up; postgres/redis (data) and registry are
+	# gated behind compose profiles so static-only pools don't pull them.
+	local profiles=()
+	while (($#)); do
+		case "$1" in
+			--with-data)     profiles+=(--profile data); shift ;;
+			--with-registry) profiles+=(--profile registry); shift ;;
+			--with-all)      profiles+=(--profile data --profile registry); shift ;;
+			-*) die "unknown flag: $1 (try --with-data, --with-registry, --with-all)" ;;
+			*)  die "unexpected arg: $1" ;;
+		esac
+	done
+	compose_infra "${profiles[@]}" up -d
+	ok "infra up"
+}
 cmd_infra_down()    { compose_infra down; ok "infra down"; }
 cmd_infra_restart() { compose_infra restart; ok "infra restarted"; }
 cmd_infra_logs()    { compose_infra logs -f --tail=100 "$@"; }
@@ -461,7 +477,10 @@ mvpool — MVP-pool ops CLI
 Infra:
   bootstrap                                        run server-level bootstrap (sudo)
   infra:install                                    wire /srv/infra and gen .env
-  infra:up | infra:down | infra:restart | infra:ps
+  infra:up [--with-data] [--with-registry] [--with-all]
+                                                   default = caddy only; flags add postgres+redis
+                                                   and/or self-hosted registry (compose profiles)
+  infra:down | infra:restart | infra:ps
   infra:logs [service]
   infra:reload-caddy                               reload Caddy without downtime
   self-update                                      git pull + infra:up -d (re-applies infra changes)
