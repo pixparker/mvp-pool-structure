@@ -171,11 +171,14 @@ build_static() {
 	cp -R "$from/$static_root/" "$tmp/content"
 
 	local image="${registry}/${slug}-web:${tag}"
+	local build_time; build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	log "building static image -> $image"
 	docker buildx build \
 		--platform linux/amd64 \
 		--load \
 		--build-arg STATIC_ROOT=content \
+		--build-arg IMAGE_TAG="$tag" \
+		--build-arg BUILD_TIME="$build_time" \
 		-t "$image" \
 		"$tmp"
 	BUILT_IMAGES+=("$image")
@@ -187,10 +190,13 @@ build_single() {
 	[[ -f "$from/$df" ]] || die "$from/$df not found (override with --${service}-dockerfile)"
 
 	local image="${registry}/${slug}-${service}:${tag}"
+	local build_time; build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	log "building $service image -> $image"
 	docker buildx build \
 		--platform linux/amd64 \
 		--load \
+		--build-arg IMAGE_TAG="$tag" \
+		--build-arg BUILD_TIME="$build_time" \
 		-f "$from/$df" \
 		-t "$image" \
 		"$from"
