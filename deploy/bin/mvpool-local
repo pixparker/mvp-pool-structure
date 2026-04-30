@@ -79,7 +79,7 @@ cmd_deploy() {
 	#                            [--tag auto|<custom>] [--static-root <subdir>]
 	#                            [--api-dockerfile P] [--web-dockerfile P] [--worker-dockerfile P]
 	local slug="" from="" type="" mode="registry" tag="auto"
-	local static_root=""
+	local static_root="" cache_mode=""
 	local api_df="Dockerfile.api" web_df="Dockerfile.web" worker_df="Dockerfile.worker"
 	local app_df="Dockerfile"
 	while (($#)); do
@@ -89,6 +89,7 @@ cmd_deploy() {
 			--mode) mode="$2"; shift 2 ;;
 			--tag)  tag="$2";  shift 2 ;;
 			--static-root) static_root="$2"; shift 2 ;;
+			--cache-mode) cache_mode="$2"; shift 2 ;;
 			--api-dockerfile)    api_df="$2";    shift 2 ;;
 			--web-dockerfile)    web_df="$2";    shift 2 ;;
 			--worker-dockerfile) worker_df="$2"; shift 2 ;;
@@ -126,7 +127,7 @@ cmd_deploy() {
 	# Build per type. Each helper sets BUILT_IMAGES (a list of image names+tags).
 	BUILT_IMAGES=()
 	case "$type" in
-		static)            build_static "$slug" "$from" "$static_root" "$tag" "$registry_host" ;;
+		static)            build_static "$slug" "$from" "$static_root" "$tag" "$registry_host" "$cache_mode" ;;
 		node-server)       build_single "$slug" app    "$from" "$app_df"    "$tag" "$registry_host" ;;
 		react-node-monorepo)
 			build_single "$slug" api "$from" "$api_df" "$tag" "$registry_host"
@@ -157,28 +158,33 @@ cmd_deploy() {
 
 build_static() {
 	# Static template is framework-supplied. We materialise a temp build context
-	# containing the framework's Dockerfile + nginx.conf + the operator's static
-	# root, then build with that.
-	local slug="$1" from="$2" static_root="$3" tag="$4" registry="$5"
+	# containing the framework's Dockerfile + the chosen nginx config + the
+	# operator's static root, then build with that.
+	local slug="$1" from="$2" static_root="$3" tag="$4" registry="$5" cache_mode="${6:-no-cache}"
 	[[ -n "$static_root" ]] || die "--static-root <subdir> is required for type=static"
 	[[ -d "$from/$static_root" ]] || die "static root '$from/$static_root' does not exist"
+	[[ "$cache_mode" =~ ^(no-cache|immutable)$ ]] || die "--cache-mode must be 'no-cache' or 'immutable'"
+	[[ -f "$TEMPLATES_DIR/static/nginx-${cache_mode}.conf" ]] || \
+		die "missing nginx config $TEMPLATES_DIR/static/nginx-${cache_mode}.conf"
 
 	local tmp; tmp=$(mktemp -d)
 	trap "rm -rf '$tmp'" RETURN
 	cp "$TEMPLATES_DIR/static/Dockerfile" "$tmp/Dockerfile"
-	cp "$TEMPLATES_DIR/static/nginx.conf" "$tmp/nginx.conf"
+	cp "$TEMPLATES_DIR/static/nginx-no-cache.conf"  "$tmp/nginx-no-cache.conf"
+	cp "$TEMPLATES_DIR/static/nginx-immutable.conf" "$tmp/nginx-immutable.conf"
 	# Copy the static content as ./content so the Dockerfile's COPY pattern is stable.
 	cp -R "$from/$static_root/" "$tmp/content"
 
 	local image="${registry}/${slug}-web:${tag}"
 	local build_time; build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-	log "building static image -> $image"
+	log "building static image -> $image (cache=${cache_mode})"
 	docker buildx build \
 		--platform linux/amd64 \
 		--load \
 		--build-arg STATIC_ROOT=content \
 		--build-arg IMAGE_TAG="$tag" \
 		--build-arg BUILD_TIME="$build_time" \
+		--build-arg CACHE_MODE="$cache_mode" \
 		-t "$image" \
 		"$tmp"
 	BUILT_IMAGES+=("$image")
@@ -238,6 +244,7 @@ mvpool-local — laptop-side CLI for the MVP pool.
 Special commands (run locally):
   deploy <slug> --from <path> [--type T] [--mode registry|tarball]
                               [--tag auto|<custom>] [--static-root SUBDIR]
+                              [--cache-mode no-cache|immutable]   (static only)
                               [--api-dockerfile P] [--web-dockerfile P]
                               [--worker-dockerfile P] [--app-dockerfile P]
                               builds images locally, ships them, then triggers

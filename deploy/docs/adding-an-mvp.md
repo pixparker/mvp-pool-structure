@@ -128,11 +128,29 @@ mvpool deploy gamification \
   --static-root prototype/site
 ```
 
-- Materialises a temp build context with the framework's `Dockerfile` + `nginx.conf` + your `<subproject>/site/` folder.
+- Materialises a temp build context with the framework's `Dockerfile` + the chosen nginx config + your `<subproject>/site/` folder.
 - Builds `<registry>/<slug>-web:<sha>`, pushes (or `docker save | ssh load` in tarball mode).
 - Server pulls and starts.
 
 > Static content lives in `<subproject>/site/` (not `<subproject>/` directly) so `deploy.sh` / `register.sh` at the subproject root don't get baked into the served image. See [layout convention](#0-recommended-project-layout-the-site--scripts-convention).
+
+#### Cache behavior — `--cache-mode no-cache` (default) vs `immutable`
+
+The `static` template ships two nginx configs and picks one at build time:
+
+| `--cache-mode` | What it does | When to use |
+|---|---|---|
+| `no-cache` (**default**) | `Cache-Control: no-store, no-cache, must-revalidate` on **all** responses — HTML, CSS, JS, images, everything. | Raw HTML/CSS/JS folders without a build step. **The right default for `static`** because filenames don't carry content hashes, so any cached asset becomes stale on the next deploy. Without this, visitors see "I edited the CSS but it still looks the same" for up to 7 days after every deploy. |
+| `immutable` | 7-day immutable cache for assets (`*.js`, `*.css`, fonts, images), no-cache for HTML. | When your `site/` *does* contain hash-versioned filenames (e.g. you pre-built a Vite/webpack bundle and committed `site/assets/index-a1b2c3.js`). Filenames change per deploy, so long-cached old files are simply unreferenced — fastest possible repeat-visit performance. |
+
+Override at deploy time:
+
+```bash
+mvpool-local deploy <slug> --from . --type static --static-root site \
+    --cache-mode immutable                                 # opt-in to long cache
+```
+
+The chosen mode is recorded in `/version.txt` (`cache_mode=...`) and as the `mvpool.cache_mode` Docker label on the image.
 
 ### `--type node-server`
 
