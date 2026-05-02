@@ -95,6 +95,32 @@ That tells Caddy to serve HTTP only on port 80. Cloudflare in front does the pub
 - For long-running operations on the server (apt install, install-bundle, etc.) prefer `setsid nohup ... > /var/log/foo.log 2>&1 &` and poll the log over short SSH commands. SSH session drops then don't kill the work.
 - For file transfer, **rsync's `--partial`** is necessary; long single-stream transfers get cut. If a single rsync drop loses progress repeatedly, fall back to per-file `scp` with a retry loop and a size check after each attempt.
 
+## Operator-laptop VPN/proxy config — direct rules for Iranian services
+
+If the operator's laptop runs a foreign-exit VPN (v2ray, Shadowrocket, Clash, …) to reach blocked resources, **every Iran-hosted resource must be on a DIRECT (no-proxy) rule**. Otherwise traffic exits abroad and Iran-side services (Arvan edges, the ArvanCloud panel, the pool VPS itself) reject the foreign-IP return path. Symptoms look like server faults (`SSL_ERROR_SYSCALL`, TCP timeouts, empty 200 responses, SSH exit code 255) but the server is fine — the laptop is the problem.
+
+**Minimum DIRECT-rule list (add before any DevOps work on the pool):**
+
+- Domain suffixes: `<pool-domain>` + every per-MVP brand domain hosted on the pool (e.g. `pagio.ir`, `mizro.ir`, `mizit.ir`, `farawand.ir`), plus `arvancloud.ir` (panel + API).
+- Bare IPs: the pool VPS public IP (e.g. `94.182.93.28` for `pagio.ir`). Without this, `ssh pagio` and any direct-IP curl will fail.
+- Simpler alternative: CIDR rules covering Iranian allocations (`94.182.0.0/16` for the pool host's range, `185.143.232.0/22` for ArvanCloud edge anycast observed in the field).
+
+**Fakedns is a separate gotcha — DIRECT alone isn't enough.** Even with a `DOMAIN-SUFFIX,…,DIRECT` rule, Shadowrocket's fakedns still hijacks DNS lookups (returns `198.18.0.x`) and routes connections through its local TCP handler. Apps appear to "work" while never reaching the real server — `dig` returns fake IPs, `bash </dev/tcp/…>` connects to the fake IP, browser HTTPS may return empty 200s from Shadowrocket itself rather than from the real origin.
+
+**Verification recipe (use this before debugging any "Arvan/cert/Caddy is broken" report):**
+
+```bash
+# Get the real edge IP via authoritative NS, bypassing system DNS:
+REAL_IP=$(dig +short <host>.<pool-domain> @v.ns.arvancdn.ir | head -1)
+
+# Probe via --resolve to bypass system DNS entirely:
+curl -sI --resolve "<host>.<pool-domain>:443:${REAL_IP}" "https://<host>.<pool-domain>/"
+```
+
+A real Arvan edge response includes `server: ArvanCloud` and `x-request-id: …` headers. Anything else (empty body, missing those headers) means the system-DNS path was intercepted by Shadowrocket. **If `--resolve` succeeds but plain curl fails, the laptop is misconfigured — don't tweak Caddy, Arvan, or certs.**
+
+To fully bypass Shadowrocket for browser-based UX testing: add `,no-resolve` to the rule (raw config; some UIs don't expose this), switch Settings → DNS from Fake-IP to Direct mode, or quit Shadowrocket entirely while testing.
+
 ## End-to-end bring-up sequence (restricted network)
 
 ```bash
