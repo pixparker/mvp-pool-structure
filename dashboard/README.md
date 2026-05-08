@@ -30,9 +30,10 @@ open http://localhost:3030
 
 ## Install on the build host
 
-The `tools-server` bootstrap (`deploy/tools-server/bootstrap.sh`) installs Bun,
-rsyncs this folder to `/srv/build/dashboard/`, runs `bun install`, and
-registers the systemd unit `mvpool-dashboard.service`. After bootstrap:
+The `tools-server` bootstrap (`deploy/tools-server/bootstrap.sh`) installs
+Bun, rsyncs **this folder** (repo-root `dashboard/`) to
+`/srv/build/dashboard/`, runs `bun install`, and registers the systemd
+unit `mvpool-dashboard.service`. After bootstrap:
 
 ```bash
 ssh hetzner "systemctl status mvpool-dashboard"

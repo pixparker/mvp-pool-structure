@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+npm-debug.log*
+*.log
+.DS_Store

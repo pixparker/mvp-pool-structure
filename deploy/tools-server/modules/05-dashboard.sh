@@ -5,7 +5,9 @@
 set -euo pipefail
 note() { printf '   %s\n' "$*"; }
 
-DASHBOARD_SRC="$(cd "$TOOLS_SERVER_ROOT/.." && pwd)/dashboard"
+# dashboard/ now lives at the repo root (not under deploy/), so the source
+# path is two levels up from this module's tools-server/ dir.
+DASHBOARD_SRC="$(cd "$TOOLS_SERVER_ROOT/../.." && pwd)/dashboard"
 DASHBOARD_DST=/srv/build/dashboard
 USER_HOME="$(getent passwd "$BUILD_USER" | cut -d: -f6)"
 BUN_BIN="$USER_HOME/.bun/bin/bun"

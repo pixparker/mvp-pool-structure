@@ -15,10 +15,15 @@
   .b-staging { background: #fef3c7; color: #92400e; border: 1px solid #fde68a; }
   .b-qa      { background: #ede9fe; color: #5b21b6; border: 1px solid #ddd6fe; }
   .b-lab     { background: #e2e8f0; color: #334155; border: 1px solid #cbd5e1; }
-  .s-pending    { color: #92400e; }
-  .s-delivering { color: #1d4ed8; }
-  .s-live       { color: #166534; }
-  .s-failed     { color: #991b1b; }
+  .s-pending        { color: #92400e; }
+  .s-delivering     { color: #1d4ed8; }
+  .s-live           { color: #166534; }
+  .s-verified       { color: #166534; }
+  .s-verify-failed  { color: #b45309; }
+  .s-failed         { color: #991b1b; }
+  .h-verified       { color: #16a34a; }
+  .h-verify-failed  { color: #d97706; }
+  .h-unknown        { color: #94a3b8; }
   .blink { animation: blink 1.6s ease-in-out infinite; }
   @keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
   /* Make tables a bit denser than daisyUI's default for an ops feel */
@@ -93,6 +98,7 @@
             <tr class="text-xs uppercase tracking-wider text-base-content/60">
               <th>slug</th>
               <th>env</th>
+              <th>health</th>
               <th>url</th>
               <th>tag</th>
               <th>deployed</th>
@@ -105,6 +111,22 @@
               <tr class="hover">
                 <td class="font-medium cursor-pointer" @click="openSlug(row.slug)" x-text="row.base"></td>
                 <td><span class="badge badge-sm" :class="'b-' + row.env" x-text="row.env"></span></td>
+                <td>
+                  <span class="inline-flex items-center gap-1 text-xs" :class="'h-' + row.health"
+                        :title="row.health === 'verified' ? 'Last deploy verified — URL responds with the expected tag'
+                              : row.health === 'verify-failed' ? 'Deployed but the URL didn\\'t respond / wrong tag'
+                              : 'No verify recorded for the latest deploy'">
+                    <template x-if="row.health === 'verified'">
+                      <span class="font-bold">✓ healthy</span>
+                    </template>
+                    <template x-if="row.health === 'verify-failed'">
+                      <span class="font-bold">⚠ failed</span>
+                    </template>
+                    <template x-if="row.health === 'unknown'">
+                      <span>—</span>
+                    </template>
+                  </span>
+                </td>
                 <td>
                   <template x-if="row.url">
                     <a :href="row.url" target="_blank" rel="noopener"
@@ -121,7 +143,17 @@
                 <td class="font-mono text-xs">
                   <span x-text="row.live_tag || '—'" :class="row.live_tag ? '' : 'text-base-content/40'"></span>
                 </td>
-                <td class="text-base-content/60 text-xs whitespace-nowrap" x-text="row.live_ts ? ago(row.live_ts) : '—'"></td>
+                <td class="text-base-content/60 text-xs whitespace-nowrap" x-text="row.live_ts ? ago(row.live_ts) : '—'">
+                  <template x-if="row.metrics">
+                    <div class="text-base-content/50 text-[10px] mt-0.5"
+                         :title="metricTooltip(row.metrics)">
+                      <span x-text="dur(row.metrics.total_s)"></span>
+                      <template x-if="row.metrics.image_bytes">
+                        <span> · <span x-text="bytes(row.metrics.image_bytes)"></span></span>
+                      </template>
+                    </div>
+                  </template>
+                </td>
                 <td>
                   <template x-if="row.inflight">
                     <span class="inline-flex items-center gap-2 text-xs"
@@ -236,6 +268,15 @@
             <div class="text-xs text-base-content/60" :title="r.ts" x-text="ago(r.ts)"></div>
           </div>
           <div class="text-xs text-base-content/60" x-text="(r.actor || '?') + ' · ' + (r.mode || '?') + (r.job_id ? ' · job=' + r.job_id : '')"></div>
+          <template x-if="r.total_s != null || r.build_s != null || r.image_bytes != null">
+            <div class="text-xs text-base-content/60 flex flex-wrap gap-x-3">
+              <template x-if="r.build_s != null"><span>build <span class="font-mono" x-text="dur(r.build_s)"></span></span></template>
+              <template x-if="r.ship_s  != null"><span>ship  <span class="font-mono" x-text="dur(r.ship_s)"></span></span></template>
+              <template x-if="r.start_s != null"><span>start <span class="font-mono" x-text="dur(r.start_s)"></span></span></template>
+              <template x-if="r.total_s != null"><span>total <span class="font-mono font-semibold" x-text="dur(r.total_s)"></span></span></template>
+              <template x-if="r.image_bytes != null"><span>image <span class="font-mono" x-text="bytes(r.image_bytes)"></span></span></template>
+            </div>
+          </template>
 
           <div class="flex flex-wrap gap-2 pt-1" x-show="r.status === 'live' || r.status === 'failed'">
             <button class="btn btn-xs btn-ghost" @click="showCmd('rollback', r)">↶ rollback to this tag</button>
@@ -332,6 +373,31 @@ function dash() {
     fmtTime(iso) {
       if (!iso) return ''
       return new Date(iso).toLocaleTimeString()
+    },
+    dur(s) {
+      if (s == null) return '—'
+      const n = Number(s)
+      if (n < 60) return n + 's'
+      const m = Math.floor(n / 60), r = n % 60
+      return r ? `${m}m ${r}s` : `${m}m`
+    },
+    bytes(b) {
+      if (b == null) return '—'
+      const n = Number(b)
+      if (n < 1024) return n + ' B'
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+      if (n < 1024 ** 3) return (n / 1024 / 1024).toFixed(1) + ' MB'
+      return (n / 1024 ** 3).toFixed(2) + ' GB'
+    },
+    metricTooltip(m) {
+      if (!m) return ''
+      const parts = []
+      if (m.build_s != null)     parts.push(`build ${this.dur(m.build_s)}`)
+      if (m.ship_s != null)      parts.push(`ship ${this.dur(m.ship_s)}`)
+      if (m.start_s != null)     parts.push(`start ${this.dur(m.start_s)}`)
+      if (m.total_s != null)     parts.push(`total ${this.dur(m.total_s)}`)
+      if (m.image_bytes != null) parts.push(`image ${this.bytes(m.image_bytes)}`)
+      return parts.join(' · ')
     },
     ago(iso) {
       if (!iso) return ''

@@ -339,19 +339,31 @@ CURRENT_TAG=
 EOF
 	chmod 600 "$app_dir/.meta"
 
-	# 6. Caddy site snippet. Static MVPs use the static-only template (no /api/* route).
-	if [[ "$type" == "static" ]]; then
-		render_template "$TEMPLATES_DIR/_shared/caddy-site.static.tpl" \
-			"DOMAIN=$domain" \
-			"WEB_HOST=mvp-${slug}-web-1" \
-			> "$SITES_DIR/$slug.caddy"
-	else
-		render_template "$TEMPLATES_DIR/_shared/caddy-site.api-web.tpl" \
-			"DOMAIN=$domain" \
-			"API_HOST=mvp-${slug}-api-1" "API_PORT=4000" \
-			"WEB_HOST=mvp-${slug}-web-1" "WEB_PORT=80" \
-			> "$SITES_DIR/$slug.caddy"
-	fi
+	# 6. Caddy site snippet. Pick template by MVP shape:
+	#    - static          → one nginx container on :80 (whole site)
+	#    - node-server     → one app container on :4000 (whole site)
+	#    - react-node-monorepo / full-stack-queue → api on :4000 + web on :80
+	case "$type" in
+		static)
+			render_template "$TEMPLATES_DIR/_shared/caddy-site.static.tpl" \
+				"DOMAIN=$domain" \
+				"WEB_HOST=mvp-${slug}-web-1" \
+				> "$SITES_DIR/$slug.caddy"
+			;;
+		node-server)
+			render_template "$TEMPLATES_DIR/_shared/caddy-site.node-server.tpl" \
+				"DOMAIN=$domain" \
+				"APP_HOST=mvp-${slug}-app-1" "APP_PORT=4000" \
+				> "$SITES_DIR/$slug.caddy"
+			;;
+		*)
+			render_template "$TEMPLATES_DIR/_shared/caddy-site.api-web.tpl" \
+				"DOMAIN=$domain" \
+				"API_HOST=mvp-${slug}-api-1" "API_PORT=4000" \
+				"WEB_HOST=mvp-${slug}-web-1" "WEB_PORT=80" \
+				> "$SITES_DIR/$slug.caddy"
+			;;
+	esac
 
 	regen_projects_json
 	ok "MVP '$slug' registered."

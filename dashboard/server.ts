@@ -21,7 +21,7 @@ const PORT     = Number(process.env.PORT ?? 3030)
 const HOST     = process.env.HOST ?? '127.0.0.1'
 const PUBLIC   = `${import.meta.dir}/public`
 
-type Status = 'pending' | 'delivering' | 'live' | 'failed'
+type Status = 'pending' | 'delivering' | 'live' | 'verified' | 'verify-failed' | 'failed'
 
 interface DeployRecord {
   ts: string
@@ -36,6 +36,12 @@ interface DeployRecord {
   target_host?: string
   url?: string
   job_id?: string
+  // Phase durations (seconds) — only present on the 'live' or later record
+  build_s?: number
+  ship_s?: number
+  start_s?: number
+  total_s?: number
+  image_bytes?: number
 }
 
 async function readDeploys(): Promise<DeployRecord[]> {
@@ -68,22 +74,50 @@ function liveSnapshot(records: DeployRecord[]) {
     live_ts: string | null
     live_actor: string | null
     url: string | null
+    health: 'verified' | 'verify-failed' | 'unknown'
+    metrics: { build_s?: number; ship_s?: number; start_s?: number; total_s?: number; image_bytes?: number } | null
     inflight: DeployRecord | null
   }> = []
 
+  // Treat live | verified | verify-failed as "the deploy reached a final state"
+  // for the purposes of the latest-row pick. Health is taken from the *most
+  // recent* of those three states.
+  const FINAL = new Set<Status>(['live', 'verified', 'verify-failed'])
+
   for (const [slug, history] of bySlug) {
     history.sort((a, b) => a.ts.localeCompare(b.ts))
-    const live = [...history].reverse().find(r => r.status === 'live') ?? null
-    const last = history[history.length - 1] ?? null
-    const inflight = last && last !== live && last.status !== 'live' ? last : null
+    const final = [...history].reverse().find(r => FINAL.has(r.status)) ?? null
+    const live  = [...history].reverse().find(r => r.status === 'live') ?? null
+    const last  = history[history.length - 1] ?? null
+    const inflight = last && !FINAL.has(last.status) && last.status !== 'failed' ? last : null
+
+    let health: 'verified' | 'verify-failed' | 'unknown' = 'unknown'
+    if (final?.status === 'verified')      health = 'verified'
+    else if (final?.status === 'verify-failed') health = 'verify-failed'
+
+    // Metrics live on the 'live' record (where mvpool-local writes them).
+    const metricsSrc = live ?? final
+    const metrics = metricsSrc && (
+      metricsSrc.build_s != null || metricsSrc.ship_s != null ||
+      metricsSrc.total_s != null || metricsSrc.image_bytes != null)
+      ? {
+        build_s:     metricsSrc.build_s,
+        ship_s:      metricsSrc.ship_s,
+        start_s:     metricsSrc.start_s,
+        total_s:     metricsSrc.total_s,
+        image_bytes: metricsSrc.image_bytes,
+      } : null
+
     rows.push({
       slug,
-      base:       live?.base   ?? last?.base   ?? slug,
-      env:        live?.env    ?? last?.env    ?? 'prod',
-      live_tag:   live?.tag    ?? null,
-      live_ts:    live?.ts     ?? null,
-      live_actor: live?.actor  ?? null,
-      url:        live?.url    ?? last?.url    ?? null,
+      base:       final?.base   ?? last?.base   ?? slug,
+      env:        final?.env    ?? last?.env    ?? 'prod',
+      live_tag:   live?.tag     ?? final?.tag   ?? null,
+      live_ts:    live?.ts      ?? final?.ts    ?? null,
+      live_actor: live?.actor   ?? final?.actor ?? null,
+      url:        final?.url    ?? last?.url    ?? null,
+      health,
+      metrics,
       inflight,
     })
   }

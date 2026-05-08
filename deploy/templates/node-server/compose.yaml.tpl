@@ -12,11 +12,17 @@ services:
     networks:
       - edge
       - data
+    # node:alpine doesn't ship wget/curl, but Node itself is guaranteed
+    # present. Use the built-in http module so the healthcheck works
+    # against any node-server image without forcing apk-add in user
+    # Dockerfiles. Non-2xx marks the container unhealthy.
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:${API_PORT:-4000}/health"]
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:'+(process.env.API_PORT||4000)+'/health',r=>process.exit(r.statusCode>=200&&r.statusCode<300?0:1)).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 3s
       retries: 3
+      start_period: 5s
 
 networks:
   edge:

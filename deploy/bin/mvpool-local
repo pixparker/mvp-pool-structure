@@ -119,6 +119,12 @@ print(match[0]['id'] if match else '')
 # Best-effort — never fail the deploy because the log write didn't land.
 deploy_record() {
 	# usage: deploy_record <slug> <tag> <status>
+	# Optional metrics passed via env vars (set by cmd_deploy / ship_tarball):
+	#   MVPOOL_T_BUILD_S    seconds in the build phase
+	#   MVPOOL_T_SHIP_S     seconds in ship_tarball
+	#   MVPOOL_T_START_S    seconds in remote deploy/start (compose up)
+	#   MVPOOL_T_TOTAL_S    seconds end-to-end
+	#   MVPOOL_IMAGE_BYTES  total bytes of image tarballs shipped
 	local slug="$1" tag="$2" status="$3"
 	[[ -n "$BUILD_ON_HOST" ]] || return 0
 	local ts env base actor mode_v url
@@ -132,11 +138,20 @@ deploy_record() {
 	fi
 	url=""
 	[[ -n "${POOL_DOMAIN:-}" ]] && url="https://${slug}.${POOL_DOMAIN}"
+
+	# Build the metrics fragment. Emit only fields we have so old records
+	# with no metrics still parse cleanly.
+	local metrics=""
+	[[ -n "${MVPOOL_T_BUILD_S:-}"   ]] && metrics+=",\"build_s\":${MVPOOL_T_BUILD_S}"
+	[[ -n "${MVPOOL_T_SHIP_S:-}"    ]] && metrics+=",\"ship_s\":${MVPOOL_T_SHIP_S}"
+	[[ -n "${MVPOOL_T_START_S:-}"   ]] && metrics+=",\"start_s\":${MVPOOL_T_START_S}"
+	[[ -n "${MVPOOL_T_TOTAL_S:-}"   ]] && metrics+=",\"total_s\":${MVPOOL_T_TOTAL_S}"
+	[[ -n "${MVPOOL_IMAGE_BYTES:-}" ]] && metrics+=",\"image_bytes\":${MVPOOL_IMAGE_BYTES}"
+
 	local record
 	# shellcheck disable=SC2016
-	record=$(printf '{"ts":"%s","slug":"%s","env":"%s","base":"%s","tag":"%s","status":"%s","actor":"%s","mode":"%s","build_host":"%s","target_host":"%s","url":"%s","job_id":"%s"}' \
-		"$ts" "$slug" "$env" "$base" "$tag" "$status" "$actor" "$mode_v" "$BUILD_ON_HOST" "$SSH_HOST" "$url" "${MVPOOL_JOB_ID:-}")
-	# Use bash -lc so the heredoc-style append is atomic-ish. Fire-and-forget.
+	record=$(printf '{"ts":"%s","slug":"%s","env":"%s","base":"%s","tag":"%s","status":"%s","actor":"%s","mode":"%s","build_host":"%s","target_host":"%s","url":"%s","job_id":"%s"%s}' \
+		"$ts" "$slug" "$env" "$base" "$tag" "$status" "$actor" "$mode_v" "$BUILD_ON_HOST" "$SSH_HOST" "$url" "${MVPOOL_JOB_ID:-}" "$metrics")
 	build_sh "mkdir -p /srv/build/.deploys && printf '%s\n' '$record' >> /srv/build/.deploys/deployments.jsonl" >/dev/null 2>&1 || true
 }
 
@@ -237,6 +252,11 @@ cmd_deploy() {
 
 	deploy_record_with_track "pending"
 
+	# Phase timestamps for duration tracking. These get passed to deploy_record
+	# via env vars (MVPOOL_T_*) so the dashboard can show "build 42s, ship 1m18s".
+	local _t0 _t1 _t2 _t3
+	_t0="$(date +%s)"
+
 	# Build per type. Each helper sets BUILT_IMAGES (a list of image names+tags).
 	BUILT_IMAGES=()
 	case "$type" in
@@ -256,21 +276,43 @@ cmd_deploy() {
 		*) die "no build recipe for type '$type'" ;;
 	esac
 
+	_t1="$(date +%s)"
+	export MVPOOL_T_BUILD_S=$(( _t1 - _t0 ))
 	deploy_record_with_track "delivering"
 
-	# Ship.
+	# Ship. Captures total tarball bytes into MVPOOL_IMAGE_BYTES (env).
+	export MVPOOL_IMAGE_BYTES=0
 	if [[ "$mode" == "registry" ]]; then
 		ship_registry
 	else
 		ship_tarball
 	fi
 
+	_t2="$(date +%s)"
+	export MVPOOL_T_SHIP_S=$(( _t2 - _t1 ))
+
 	# Trigger remote deploy.
 	log "$slug: triggering remote deploy"
 	remote_sh "mvpool deploy $slug --tag $tag --mode $mode"
 
+	_t3="$(date +%s)"
+	export MVPOOL_T_START_S=$(( _t3 - _t2 ))
+	export MVPOOL_T_TOTAL_S=$(( _t3 - _t0 ))
+
 	deploy_record_with_track "live"
-	ok "deployed $slug @ $tag"
+
+	# Pretty summary line.
+	local size_mb=""
+	if (( MVPOOL_IMAGE_BYTES > 0 )); then
+		size_mb=" · image=$(awk -v b="$MVPOOL_IMAGE_BYTES" 'BEGIN{printf "%.1f MB", b/1048576}')"
+	fi
+	ok "deployed $slug @ $tag — build=${MVPOOL_T_BUILD_S}s ship=${MVPOOL_T_SHIP_S}s start=${MVPOOL_T_START_S}s total=${MVPOOL_T_TOTAL_S}s${size_mb}"
+
+	# Verify the deployed URL actually answers + matches the tag we just shipped.
+	# Best-effort: don't fail the deploy if verification fails (the deploy
+	# itself succeeded); just warn loudly. The 'verify-failed' record lets the
+	# dashboard surface the issue.
+	cmd_verify "$slug" --tag "$tag" || warn "$slug: post-deploy verification failed — site may not be reachable yet"
 }
 
 build_static() {
@@ -419,6 +461,15 @@ ship_tarball_via_build_host() {
 		log "saving on $BUILD_ON_HOST: $image -> $remote_tar"
 		build_sh "mkdir -p /srv/build/.ship && docker save '$image' | zstd -T0 -3 > '$remote_tar'"
 
+		# Capture tarball size (bytes) for the deploy record.
+		local img_bytes
+		img_bytes="$(build_sh "stat -c '%s' '$remote_tar' 2>/dev/null || stat -f '%z' '$remote_tar'" 2>/dev/null | tr -d '\r' | head -1 || true)"
+		if [[ "$img_bytes" =~ ^[0-9]+$ ]]; then
+			MVPOOL_IMAGE_BYTES=$(( ${MVPOOL_IMAGE_BYTES:-0} + img_bytes ))
+			export MVPOOL_IMAGE_BYTES
+			log "tarball size: $(awk -v b="$img_bytes" 'BEGIN{printf "%.1f MB", b/1048576}')"
+		fi
+
 		log "rsync $BUILD_ON_HOST -> laptop ($fname)"
 		# shellcheck disable=SC2086
 		rsync -a --partial --progress \
@@ -446,6 +497,119 @@ cmd_arvan_ensure() {
 	[[ -n "$ARVAN_TOKEN" && -n "$ARVAN_DOMAIN" && -n "$ARVAN_ORIGIN_IP" ]] || \
 		die "set MVPOOL_ARVANCLOUD_API_TOKEN, _DOMAIN, _ORIGIN_IP in $CONFIG_FILE"
 	arvan_dns_ensure "$slug"
+}
+
+# ---------- verify -------------------------------------------------------
+# Resolve the deployed URL via the authoritative ArvanCloud nameserver
+# (bypasses Shadowrocket fakedns + ISP recursive caching), curl /api/version
+# and /version.txt, parse the tag, compare to the expected tag. Append a
+# 'verified' or 'verify-failed' deploy_record so the dashboard can show it.
+#
+# Usage:
+#   mvpool-local verify <slug>                # uses CURRENT_TAG from .meta
+#   mvpool-local verify <slug> --tag <tag>    # explicit
+cmd_verify() {
+	local slug="${1:-}" expected=""
+	[[ -n "$slug" ]] || die "usage: mvpool-local verify <slug> [--tag <tag>]"
+	shift
+	while (($#)); do
+		case "$1" in
+			--tag) expected="$2"; shift 2 ;;
+			*) die "unknown flag: $1" ;;
+		esac
+	done
+
+	derive_pool_domain
+	local domain="${slug}.${POOL_DOMAIN}"
+
+	if [[ -z "$expected" ]]; then
+		expected="$(remote_meta_value "$slug" CURRENT_TAG)"
+		[[ -n "$expected" ]] || die "couldn't read CURRENT_TAG from server; pass --tag <tag>"
+	fi
+
+	log "verify: ${domain} expected tag=${expected}"
+
+	# Resolve via authoritative ArvanCloud NS first (avoids Shadowrocket
+	# fakedns 198.18.x and Iran ISP recursive resolvers that often fail
+	# Cloudflare-anycast NSes). Fall back to system DNS, then to the
+	# pool VPS's known origin IP. dig with `+short` writes errors like
+	# "connection timed out" to stdout on failure, so we have to validate
+	# that what came back is actually an IP.
+	# pipefail + dig-timeout would exit -e the whole script silently — guard
+	# every command-sub with `|| true` so we keep going through fallbacks.
+	local edge_ip="" raw=""
+	for ns in '@v.ns.arvancdn.ir' ''; do
+		# shellcheck disable=SC2086
+		raw="$( { dig +short +time=3 +tries=1 $ns "$domain" A 2>/dev/null || true; } | head -1 || true)"
+		if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+			edge_ip="$raw"
+			break
+		fi
+	done
+
+	# Last-resort fallback: hit the origin IP directly (skips ArvanCloud
+	# edge — won't validate TLS/CDN, but does prove the container responds).
+	local hit_origin=0
+	if [[ -z "$edge_ip" && -n "$ARVAN_ORIGIN_IP" ]]; then
+		warn "verify: DNS unreachable — falling back to origin IP ${ARVAN_ORIGIN_IP} (no edge TLS check)"
+		edge_ip="$ARVAN_ORIGIN_IP"
+		hit_origin=1
+	fi
+
+	[[ -n "$edge_ip" ]] || { warn "verify: couldn't resolve $domain — skipping"; deploy_record "$slug" "$expected" "verify-failed"; return 1; }
+
+	# Try /api/version (node-server shape) then /version.txt (static shape).
+	# Retry up to 5x with short backoff for fresh ArvanCloud DNS records.
+	# When falling back to origin IP (no DNS), hit HTTP/80 directly with
+	# Host header — origin Caddy in restricted-network mode is HTTP-only.
+	local proto resolve_arg curl_extra
+	if (( hit_origin )); then
+		proto="http"
+		resolve_arg="--resolve ${domain}:80:${edge_ip}"
+		curl_extra="-H Host:${domain}"
+	else
+		proto="https"
+		resolve_arg="--resolve ${domain}:443:${edge_ip}"
+		curl_extra=""
+	fi
+
+	local actual="" body="" code="" attempt=0 path=""
+	for path in /api/version /version.txt; do
+		for attempt in 1 2 3 4 5; do
+			# shellcheck disable=SC2086
+			body="$(curl -sk --max-time 5 $resolve_arg $curl_extra "${proto}://${domain}${path}" 2>/dev/null)" || true
+			# shellcheck disable=SC2086
+			code="$(curl -sk --max-time 5 -o /dev/null -w '%{http_code}' $resolve_arg $curl_extra "${proto}://${domain}${path}" 2>/dev/null || echo 000)"
+			if [[ "$code" == "200" && -n "$body" ]]; then break 2; fi
+			sleep 2
+		done
+	done
+
+	if [[ "$code" != "200" || -z "$body" ]]; then
+		warn "verify: ${domain} not reachable (last http=${code})"
+		deploy_record "$slug" "$expected" "verify-failed"
+		return 1
+	fi
+
+	# Extract tag — try JSON .tag, then 'tag=' line.
+	if [[ "$body" == *'"tag"'* ]]; then
+		actual="$(printf '%s' "$body" | python3 -c "import sys,json
+try: print(json.load(sys.stdin).get('tag',''))
+except: pass" 2>/dev/null)"
+	fi
+	if [[ -z "$actual" ]]; then
+		actual="$(printf '%s\n' "$body" | grep -oE '^tag=[A-Za-z0-9._-]+' | head -1 | cut -d= -f2)"
+	fi
+
+	if [[ "$actual" == "$expected" ]]; then
+		ok "verify: ${domain} returns tag=${actual} ✓"
+		deploy_record "$slug" "$expected" "verified"
+		return 0
+	else
+		warn "verify: ${domain} returns tag='${actual}', expected '${expected}'"
+		deploy_record "$slug" "$expected" "verify-failed"
+		return 1
+	fi
 }
 
 # ---------- login --------------------------------------------------------
@@ -507,6 +671,7 @@ main() {
 	local sub="${1:-}"; shift || true
 	case "$sub" in
 		deploy)            cmd_deploy "$@" ;;
+		verify)            cmd_verify "$@" ;;
 		arvan:ensure)      cmd_arvan_ensure "$@" ;;
 		login)             cmd_login "$@" ;;
 		""|-h|--help|help) usage ;;
