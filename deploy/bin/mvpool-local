@@ -29,6 +29,13 @@ SSH_HOST="${MVPOOL_HOST:-}"
 SSH_PORT="${MVPOOL_PORT:-22}"
 SSH_OPTS="${MVPOOL_SSH_OPTS:--o ServerAliveInterval=30}"
 POOL_DOMAIN="${POOL_DOMAIN:-}"
+BUILD_ON_HOST="${MVPOOL_BUILD_HOST:-}"
+BUILD_ON_PORT="${MVPOOL_BUILD_PORT:-22}"
+BUILD_EXCLUDES_DEFAULT='.git node_modules .next .turbo dist build out coverage .DS_Store .docker-cache .vscode .idea'
+BUILD_EXCLUDES="${MVPOOL_BUILD_EXCLUDES:-$BUILD_EXCLUDES_DEFAULT}"
+ARVAN_TOKEN="${MVPOOL_ARVANCLOUD_API_TOKEN:-}"
+ARVAN_DOMAIN="${MVPOOL_ARVANCLOUD_DOMAIN:-}"
+ARVAN_ORIGIN_IP="${MVPOOL_ARVANCLOUD_ORIGIN_IP:-}"
 
 FRAMEWORK_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 TEMPLATES_DIR="$FRAMEWORK_ROOT/templates"
@@ -56,6 +63,81 @@ remote_pipe() {
 	# usage: cmd_to_send_locally | remote_pipe <remote-cmd...>
 	# shellcheck disable=SC2086
 	ssh $SSH_OPTS -p "$SSH_PORT" "$SSH_HOST" -- "$@"
+}
+
+# ---------- build-host helpers (used when BUILD_ON_HOST is set) -----------
+# shellcheck disable=SC2086
+build_sh() { ssh $SSH_OPTS -p "$BUILD_ON_PORT" "$BUILD_ON_HOST" -- "$@"; }
+
+build_rsync_excludes() {
+	local args=()
+	for ex in $BUILD_EXCLUDES; do args+=(--exclude="$ex"); done
+	printf '%s\n' "${args[@]}"
+}
+
+# ---------- ArvanCloud DNS helper -----------------------------------------
+# Idempotently ensure an A record exists for <slug>.<ARVAN_DOMAIN> pointing
+# at ARVAN_ORIGIN_IP with cloud-proxy ON. Free-tier ArvanCloud doesn't allow
+# proxied wildcards, so each slug needs its own record. No-op if the
+# ARVAN_* config triple isn't set.
+arvan_dns_ensure() {
+	local slug="$1"
+	[[ -n "$ARVAN_TOKEN" && -n "$ARVAN_DOMAIN" && -n "$ARVAN_ORIGIN_IP" ]] || return 0
+	need curl
+	local api="https://napi.arvancloud.ir/cdn/4.0/domains/${ARVAN_DOMAIN}/dns-records"
+	local hdr_auth="Authorization: Apikey ${ARVAN_TOKEN}"
+
+	# Check existing records for an exact name match (one API call).
+	local existing
+	existing="$(curl -fsS --max-time 8 -H "$hdr_auth" -H 'Accept: application/json' \
+		"${api}?per_page=200&search=${slug}" 2>/dev/null \
+		| python3 -c "
+import sys,json
+data=json.load(sys.stdin).get('data',[])
+match=[x for x in data if x.get('type')=='a' and x.get('name')==sys.argv[1]]
+print(match[0]['id'] if match else '')
+" "$slug" 2>/dev/null || true)"
+
+	if [[ -n "$existing" ]]; then
+		log "arvancloud: record '${slug}.${ARVAN_DOMAIN}' already exists (id=$existing)"
+		return 0
+	fi
+
+	log "arvancloud: creating A record '${slug}.${ARVAN_DOMAIN}' -> ${ARVAN_ORIGIN_IP} (cloud=on)"
+	local body
+	body=$(printf '{"type":"a","name":"%s","value":[{"ip":"%s","port":null,"weight":null,"country":""}],"ttl":120,"cloud":true,"upstream_https":"default","ip_filter_mode":{"count":"single","order":"none","geo_filter":"none"}}' \
+		"$slug" "$ARVAN_ORIGIN_IP")
+	curl -fsS -X POST --max-time 12 \
+		-H "$hdr_auth" -H 'Accept: application/json' -H 'Content-Type: application/json' \
+		-d "$body" "$api" >/dev/null \
+		&& ok   "arvancloud: record created" \
+		|| warn "arvancloud: create failed (record may exist already, or the API rejected it — continuing)"
+}
+
+# ---------- deploy event log (Hetzner-side) ------------------------------
+# Append a single JSONL record to /srv/build/.deploys/deployments.jsonl.
+# Best-effort — never fail the deploy because the log write didn't land.
+deploy_record() {
+	# usage: deploy_record <slug> <tag> <status>
+	local slug="$1" tag="$2" status="$3"
+	[[ -n "$BUILD_ON_HOST" ]] || return 0
+	local ts env base actor mode_v url
+	ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	actor="$(whoami)@$(hostname -s 2>/dev/null || echo unknown)"
+	mode_v="${MODE_FOR_RECORD:-${mode:-tarball}}"
+	if   [[ "$slug" == lab-*     ]]; then env="lab";     base="${slug#lab-}"
+	elif [[ "$slug" == staging-* ]]; then env="staging"; base="${slug#staging-}"
+	elif [[ "$slug" == qa-*      ]]; then env="qa";      base="${slug#qa-}"
+	else                                  env="prod";    base="$slug"
+	fi
+	url=""
+	[[ -n "${POOL_DOMAIN:-}" ]] && url="https://${slug}.${POOL_DOMAIN}"
+	local record
+	# shellcheck disable=SC2016
+	record=$(printf '{"ts":"%s","slug":"%s","env":"%s","base":"%s","tag":"%s","status":"%s","actor":"%s","mode":"%s","build_host":"%s","target_host":"%s","url":"%s","job_id":"%s"}' \
+		"$ts" "$slug" "$env" "$base" "$tag" "$status" "$actor" "$mode_v" "$BUILD_ON_HOST" "$SSH_HOST" "$url" "${MVPOOL_JOB_ID:-}")
+	# Use bash -lc so the heredoc-style append is atomic-ish. Fire-and-forget.
+	build_sh "mkdir -p /srv/build/.deploys && printf '%s\n' '$record' >> /srv/build/.deploys/deployments.jsonl" >/dev/null 2>&1 || true
 }
 
 derive_pool_domain() {
@@ -90,6 +172,8 @@ cmd_deploy() {
 			--tag)  tag="$2";  shift 2 ;;
 			--static-root) static_root="$2"; shift 2 ;;
 			--cache-mode) cache_mode="$2"; shift 2 ;;
+			--build-on)    BUILD_ON_HOST="$2"; shift 2 ;;
+			--no-build-on) BUILD_ON_HOST="";   shift   ;;
 			--api-dockerfile)    api_df="$2";    shift 2 ;;
 			--web-dockerfile)    web_df="$2";    shift 2 ;;
 			--worker-dockerfile) worker_df="$2"; shift 2 ;;
@@ -98,11 +182,18 @@ cmd_deploy() {
 			*) [[ -z "$slug" ]] && slug="$1" || die "unexpected arg: $1"; shift ;;
 		esac
 	done
-	[[ -n "$slug" ]] || die "usage: mvpool-local deploy <slug> --from <path> [--type T] [--mode registry|tarball]"
+	[[ -n "$slug" ]] || die "usage: mvpool-local deploy <slug> --from <path> [--type T] [--mode registry|tarball] [--build-on <ssh-alias>]"
 	[[ -n "$from" && -d "$from" ]] || die "--from <path> must point to an existing directory"
 	[[ "$mode" =~ ^(registry|tarball)$ ]] || die "--mode must be 'registry' or 'tarball'"
 	require_host
-	need docker
+	if [[ -n "$BUILD_ON_HOST" ]]; then
+		# remote build: registry mode is incompatible (laptop is the only path that
+		# can reach both Hetzner and the Iran VPS — registry hand-off doesn't help)
+		[[ "$mode" == "tarball" ]] || die "--build-on requires --mode tarball (Hetzner can't reach the pool registry)"
+		log "build host: $BUILD_ON_HOST (remote)"
+	else
+		need docker
+	fi
 
 	# Auto-detect type from the server's meta if not provided.
 	if [[ -z "$type" ]]; then
@@ -122,7 +213,29 @@ cmd_deploy() {
 			tag="$(date -u +%Y%m%d-%H%M%S)-$(openssl rand -hex 3)"
 		fi
 	fi
+	# Ensure the ArvanCloud DNS record exists *before* shipping, so the
+	# domain is resolvable as soon as the container is up. Best-effort.
+	arvan_dns_ensure "$slug"
+
 	log "deploying '$slug' (type=$type, tag=$tag, mode=$mode)"
+
+	# Status tracking for the dashboard event log. The trap ensures any
+	# unexpected exit between 'pending' and 'live' lands as 'failed'.
+	MODE_FOR_RECORD="$mode"
+	__deploy_last_status=""
+	deploy_record_with_track() {
+		deploy_record "$slug" "$tag" "$1"
+		__deploy_last_status="$1"
+	}
+	__deploy_on_exit() {
+		local rc=$?
+		if (( rc != 0 )) && [[ "$__deploy_last_status" != "live" && "$__deploy_last_status" != "" ]]; then
+			deploy_record "$slug" "$tag" "failed"
+		fi
+	}
+	trap __deploy_on_exit EXIT
+
+	deploy_record_with_track "pending"
 
 	# Build per type. Each helper sets BUILT_IMAGES (a list of image names+tags).
 	BUILT_IMAGES=()
@@ -143,6 +256,8 @@ cmd_deploy() {
 		*) die "no build recipe for type '$type'" ;;
 	esac
 
+	deploy_record_with_track "delivering"
+
 	# Ship.
 	if [[ "$mode" == "registry" ]]; then
 		ship_registry
@@ -153,6 +268,8 @@ cmd_deploy() {
 	# Trigger remote deploy.
 	log "$slug: triggering remote deploy"
 	remote_sh "mvpool deploy $slug --tag $tag --mode $mode"
+
+	deploy_record_with_track "live"
 	ok "deployed $slug @ $tag"
 }
 
@@ -177,16 +294,24 @@ build_static() {
 
 	local image="${registry}/${slug}-web:${tag}"
 	local build_time; build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-	log "building static image -> $image (cache=${cache_mode})"
-	docker buildx build \
-		--platform linux/amd64 \
-		--load \
-		--build-arg STATIC_ROOT=content \
-		--build-arg IMAGE_TAG="$tag" \
-		--build-arg BUILD_TIME="$build_time" \
-		--build-arg CACHE_MODE="$cache_mode" \
-		-t "$image" \
-		"$tmp"
+
+	if [[ -n "$BUILD_ON_HOST" ]]; then
+		log "building static image -> $image (cache=${cache_mode}, on $BUILD_ON_HOST)"
+		buildx_remote "$slug" "$tmp" "Dockerfile" "$image" "$build_time" \
+			--build-arg "STATIC_ROOT=content" \
+			--build-arg "CACHE_MODE=$cache_mode"
+	else
+		log "building static image -> $image (cache=${cache_mode})"
+		docker buildx build \
+			--platform linux/amd64 \
+			--load \
+			--build-arg STATIC_ROOT=content \
+			--build-arg IMAGE_TAG="$tag" \
+			--build-arg BUILD_TIME="$build_time" \
+			--build-arg CACHE_MODE="$cache_mode" \
+			-t "$image" \
+			"$tmp"
+	fi
 	BUILT_IMAGES+=("$image")
 }
 
@@ -197,16 +322,55 @@ build_single() {
 
 	local image="${registry}/${slug}-${service}:${tag}"
 	local build_time; build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-	log "building $service image -> $image"
-	docker buildx build \
-		--platform linux/amd64 \
-		--load \
-		--build-arg IMAGE_TAG="$tag" \
-		--build-arg BUILD_TIME="$build_time" \
-		-f "$from/$df" \
-		-t "$image" \
-		"$from"
+
+	if [[ -n "$BUILD_ON_HOST" ]]; then
+		log "building $service image -> $image (on $BUILD_ON_HOST)"
+		buildx_remote "$slug" "$from" "$df" "$image" "$build_time"
+	else
+		log "building $service image -> $image"
+		docker buildx build \
+			--platform linux/amd64 \
+			--load \
+			--build-arg IMAGE_TAG="$tag" \
+			--build-arg BUILD_TIME="$build_time" \
+			-f "$from/$df" \
+			-t "$image" \
+			"$from"
+	fi
 	BUILT_IMAGES+=("$image")
+}
+
+# Run a buildx invocation on $BUILD_ON_HOST.
+# Synchronises the build context to /srv/build/<slug>/source/, runs buildx with
+# a per-slug local cache, and loads the resulting image into the remote daemon.
+buildx_remote() {
+	# usage: buildx_remote <slug> <local-context> <dockerfile-relpath> <image> <build-time> [extra buildx flags...]
+	local slug="$1" local_ctx="$2" df="$3" image="$4" build_time="$5"
+	shift 5
+	local remote_src="/srv/build/${slug}/source"
+	local cache_dir="/srv/build/${slug}/.buildx-cache"
+	local tag="${image##*:}"
+
+	build_sh "mkdir -p $remote_src $cache_dir"
+	# shellcheck disable=SC2046
+	rsync -a --partial --progress --delete \
+		$(build_rsync_excludes) \
+		-e "ssh $SSH_OPTS -p $BUILD_ON_PORT" \
+		"$local_ctx"/ "${BUILD_ON_HOST}:${remote_src}/"
+
+	# Build extra-args bash-safely (single-quote each, escape interior single-quotes).
+	local extras=""
+	for a in "$@"; do
+		extras+=" '${a//\'/\'\\\'\'}'"
+	done
+	build_sh "cd $remote_src && \
+		docker buildx build --builder mvpool-builder --platform linux/amd64 --load \
+		--cache-to type=local,dest=$cache_dir,mode=max,compression=zstd \
+		--cache-from type=local,src=$cache_dir \
+		--build-arg IMAGE_TAG='$tag' \
+		--build-arg BUILD_TIME='$build_time' \
+		$extras \
+		-f $df -t '$image' ."
 }
 
 ship_registry() {
@@ -217,6 +381,14 @@ ship_registry() {
 }
 
 ship_tarball() {
+	if [[ -n "$BUILD_ON_HOST" ]]; then
+		ship_tarball_via_build_host
+	else
+		ship_tarball_local
+	fi
+}
+
+ship_tarball_local() {
 	# Pipe `docker save` straight into `ssh ... docker load`.
 	# This avoids a stage-on-disk and keeps the image tags intact.
 	for image in "${BUILT_IMAGES[@]}"; do
@@ -225,6 +397,55 @@ ship_tarball() {
 		docker save "$image" | gzip | \
 			ssh $SSH_OPTS -p "$SSH_PORT" "$SSH_HOST" -- 'gzip -dc | docker load'
 	done
+}
+
+# Two-rsync ship via the laptop. Save image to zstd tarball on the build host,
+# rsync to laptop (resumable), rsync laptop -> pool VPS (resumable), then ssh-load.
+# Resilience: each rsync uses --partial so a dropped Iran↔laptop link picks up
+# where it left off instead of restarting from zero (per restricted-network.md
+# field findings #4 + #8).
+ship_tarball_via_build_host() {
+	local stage; stage="$(mktemp -d -t mvpool-ship.XXXXXX)"
+	# shellcheck disable=SC2064
+	trap "rm -rf '$stage'" RETURN
+
+	for image in "${BUILT_IMAGES[@]}"; do
+		# Sanitise the image string for filenames: registry.host/slug-svc:tag → slug-svc-tag
+		local fname; fname="$(printf '%s' "${image##*/}" | tr ':/' '--').tar.zst"
+		local remote_tar="/srv/build/.ship/$fname"
+		local local_tar="$stage/$fname"
+		local pool_tar="/tmp/$fname"
+
+		log "saving on $BUILD_ON_HOST: $image -> $remote_tar"
+		build_sh "mkdir -p /srv/build/.ship && docker save '$image' | zstd -T0 -3 > '$remote_tar'"
+
+		log "rsync $BUILD_ON_HOST -> laptop ($fname)"
+		# shellcheck disable=SC2086
+		rsync -a --partial --progress \
+			-e "ssh $SSH_OPTS -p $BUILD_ON_PORT" \
+			"${BUILD_ON_HOST}:${remote_tar}" "$local_tar"
+
+		log "rsync laptop -> $SSH_HOST ($fname)"
+		# shellcheck disable=SC2086
+		rsync -a --partial --progress \
+			-e "ssh $SSH_OPTS -p $SSH_PORT" \
+			"$local_tar" "${SSH_HOST}:${pool_tar}"
+
+		log "loading on $SSH_HOST"
+		remote_sh "zstd -dc < '$pool_tar' | docker load && rm -f '$pool_tar'"
+
+		# Drop the laptop staging copy as we go to bound disk use on big multi-image deploys.
+		rm -f "$local_tar"
+	done
+}
+
+# ---------- arvan:ensure -------------------------------------------------
+cmd_arvan_ensure() {
+	local slug="${1:-}"
+	[[ -n "$slug" ]] || die "usage: mvpool-local arvan:ensure <slug>"
+	[[ -n "$ARVAN_TOKEN" && -n "$ARVAN_DOMAIN" && -n "$ARVAN_ORIGIN_IP" ]] || \
+		die "set MVPOOL_ARVANCLOUD_API_TOKEN, _DOMAIN, _ORIGIN_IP in $CONFIG_FILE"
+	arvan_dns_ensure "$slug"
 }
 
 # ---------- login --------------------------------------------------------
@@ -245,10 +466,20 @@ Special commands (run locally):
   deploy <slug> --from <path> [--type T] [--mode registry|tarball]
                               [--tag auto|<custom>] [--static-root SUBDIR]
                               [--cache-mode no-cache|immutable]   (static only)
+                              [--build-on <ssh-alias>]            (remote build)
                               [--api-dockerfile P] [--web-dockerfile P]
                               [--worker-dockerfile P] [--app-dockerfile P]
-                              builds images locally, ships them, then triggers
+                              builds images locally OR on a remote build host,
+                              ships them, then triggers
                               `mvpool deploy <slug> --tag <tag>` on the server.
+
+                              --build-on <alias>: rsync the build context to
+                              <alias>:/srv/build/<slug>/source/, run docker
+                              buildx there, save → zstd, two-rsync via the
+                              laptop to the pool VPS, ssh-load. Requires
+                              --mode tarball. Set MVPOOL_BUILD_HOST in your
+                              config to make this the default; pass
+                              --no-build-on to override back to local.
   login                       `docker login` to registry.${POOL_DOMAIN}.
 
 Everything else is forwarded to the server's `mvpool` over SSH:
@@ -266,6 +497,9 @@ Config (env or ~/.config/mvpool/config):
   MVPOOL_SSH_OPTS=
   MVPOOL_REGISTRY_USER=mvpool
   POOL_DOMAIN=example.com                 (auto-derived from server if absent)
+  MVPOOL_BUILD_HOST=ali@build-vps         (optional; default for --build-on)
+  MVPOOL_BUILD_PORT=22
+  MVPOOL_BUILD_EXCLUDES='.git node_modules .next ...'  (rsync excludes)
 EOF
 }
 
@@ -273,6 +507,7 @@ main() {
 	local sub="${1:-}"; shift || true
 	case "$sub" in
 		deploy)            cmd_deploy "$@" ;;
+		arvan:ensure)      cmd_arvan_ensure "$@" ;;
 		login)             cmd_login "$@" ;;
 		""|-h|--help|help) usage ;;
 		# Catch-all: forward to the remote `mvpool` CLI. Allocate a TTY for

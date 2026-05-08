@@ -332,7 +332,24 @@ Items learned during the actual migration. Worth knowing before the next zone:
 
 Update `deploy/docs/operations.md` Cloudflare references where appropriate. For Iran-pool VPSes, the recommended default becomes **ArvanCloud DNS + Cloud ON per record**. Cloudflare remains a fine option for non-Iran pools.
 
-### Pending framework work (P2)
+### Done as of 2026-05-08
 
-- **`mvpool mvp:add` should create the ArvanCloud DNS record automatically** when an `ARVANCLOUD_API_TOKEN` is in `/srv/infra/.env`. Mirrors the same pattern we'd want for Cloudflare. Eliminates the per-MVP manual panel step.
+- **`mvpool-local` now creates the ArvanCloud DNS record automatically** when the laptop's `~/.config/mvpool/config` has `MVPOOL_ARVANCLOUD_API_TOKEN`, `MVPOOL_ARVANCLOUD_DOMAIN`, and `MVPOOL_ARVANCLOUD_ORIGIN_IP`. The helper is idempotent: it queries existing records first, only POSTs if absent. Use the explicit subcommand `mvpool-local arvan:ensure <slug>` for ad-hoc record creation; `cmd_deploy` calls it implicitly before each ship. The token must be kept off-repo (`~/.config/mvpool/config` mode 600).
+
+  Concretely, for the **pagio.ir pool** (which runs on the **ArvanCloud free tier**):
+    ```bash
+    # ~/.config/mvpool/config (mode 600, never committed)
+    MVPOOL_HOST=pagio
+    POOL_DOMAIN=pagio.ir
+    MVPOOL_BUILD_HOST=hetzner
+    MVPOOL_ARVANCLOUD_API_TOKEN=<your token>
+    MVPOOL_ARVANCLOUD_DOMAIN=pagio.ir
+    MVPOOL_ARVANCLOUD_ORIGIN_IP=94.182.93.28
+    ```
+
+  After this is set, the per-MVP manual step at <https://panel.arvancloud.ir> goes away — `mvpool-local mvp:add <slug>` followed by `mvpool-local deploy <slug>` is enough end-to-end.
+
+### Still pending (P2/P3)
+
+- **Auto-prefix Caddy site files with `http://`** at `mvp:add` time when running on a restricted-network pool. Until this lands, the manual edit (or a wrapper script — see `demo/static-html/deploy-prod.sh`) is required after each `mvp:add`.
 - **Document the wildcard fallback explicitly** in `deploy/docs/adding-an-mvp.md` so operators know that `<new-slug>.<pool-domain>` resolves out of the box for HTTP-only access, even if they forgot to add the specific proxied record.

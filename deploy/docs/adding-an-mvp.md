@@ -2,6 +2,8 @@
 
 End-to-end, from "I have a project" to "it's live at `<slug>.${POOL_DOMAIN}`".
 
+> **DNS note for the `pagio.ir` pool:** the zone runs on **ArvanCloud free tier**. The free tier doesn't allow proxied wildcards, so each slug needs its own A record at the ArvanCloud panel with the cloud (proxy) icon ON to get edge TLS. `mvpool-local` automates this: when `MVPOOL_ARVANCLOUD_API_TOKEN` is set in `~/.config/mvpool/config`, `mvp:add` and every `deploy` will idempotently create the record via the ArvanCloud CDN 4.0 API. Without that token, you'll need to add the record by hand at <https://panel.arvancloud.ir/cdn/pagio.ir/dns>. See `deploy/docs/restricted-network.md` → ArvanCloud section for the full rationale.
+
 ## 0. Recommended project layout (the "site/ + scripts" convention)
 
 Every project that lives in this pool should colocate its deploy wrappers next to whatever it deploys. The pattern is:

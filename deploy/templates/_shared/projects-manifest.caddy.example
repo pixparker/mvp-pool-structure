@@ -1,0 +1,48 @@
+# Drop this `handle` block inside your pool-home Caddy site (e.g.
+# /srv/infra/sites/pagio-home.caddy) so the homepage can fetch the live
+# manifest of registered MVPs without being redeployed.
+#
+# Where to put it: inside the existing site block, *before* the catch-all
+# `handle { reverse_proxy ... }` that proxies the rest of the page.
+#
+# After editing, reload Caddy:
+#   mvpool infra:reload-caddy
+#
+# Behind the scenes:
+#   - mvpool regenerates /srv/infra/sites/_projects.json on every
+#     mvp:add / mvp:remove / deploy.
+#   - That host path is bind-mounted (read-only) into Caddy at
+#     /etc/caddy/sites/_projects.json.
+#   - The leading underscore keeps it out of the Caddyfile's
+#     `import /etc/caddy/sites/*.caddy` glob.
+#
+# JSON shape:
+#   {
+#     "generated_at": "2026-05-08T15:00:00Z",
+#     "pool_domain": "pagio.ir",
+#     "projects": [
+#       {
+#         "slug": "hello-static",
+#         "base": "hello-static",
+#         "env": "prod",
+#         "type": "static",
+#         "domain": "hello-static.pagio.ir",
+#         "url": "https://hello-static.pagio.ir",
+#         "current_tag": "d5bbee8"
+#       },
+#       ...
+#     ]
+#   }
+#
+# CORS: this serves on the same hostname as the homepage, so no CORS
+# headers are needed for fetch() from the same page. Add an
+# Access-Control-Allow-Origin header inside `handle /projects.json` if
+# another origin needs to read it.
+
+handle /projects.json {
+	root * /etc/caddy/sites
+	rewrite * /_projects.json
+	header Cache-Control "public, max-age=30"
+	header Content-Type "application/json; charset=utf-8"
+	file_server
+}

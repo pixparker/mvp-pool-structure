@@ -1,0 +1,14 @@
+{
+  "name": "mvpool-dashboard",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "main": "server.ts",
+  "scripts": {
+    "start": "bun server.ts",
+    "dev":   "bun --watch server.ts"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  }
+}

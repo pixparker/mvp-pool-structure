@@ -114,6 +114,56 @@ append_deploy_log() {
 		"$ts" "$slug" "$tag" "$mode" >> "$DEPLOY_LOG"
 }
 
+# Regenerate /srv/infra/sites/_projects.json — a public manifest of every MVP
+# currently registered on this pool. The pool homepage (pagio-home etc.) can
+# fetch this via `/projects.json` to render the list dynamically without
+# being redeployed every time a new MVP is added.
+#
+# The leading underscore in the filename keeps it out of the Caddyfile's
+# `import /etc/caddy/sites/*.caddy` glob (which only matches *.caddy).
+#
+# A separate Caddy site snippet (e.g. in pagio-home.caddy) is responsible
+# for exposing the file at /projects.json — see:
+# deploy/templates/_shared/projects-manifest.caddy.example
+regen_projects_json() {
+	mkdir -p "$SITES_DIR"
+	local final="$SITES_DIR/_projects.json"
+	local tmp="${final}.tmp.$$"
+	# Pick up POOL_DOMAIN from infra/.env even when callers haven't loaded it.
+	local pool="${POOL_DOMAIN:-}"
+	if [[ -z "$pool" && -f "$INFRA_ENV" ]]; then
+		pool=$(awk -F= '$1=="POOL_DOMAIN"{print $2; exit}' "$INFRA_ENV")
+	fi
+	pool="${pool:-unknown}"
+	local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+	{
+		printf '{"generated_at":"%s","pool_domain":"%s","projects":[' "$ts" "$pool"
+		local first=1
+		for m in "$APPS_DIR"/*/.meta; do
+			[[ -f "$m" ]] || continue
+			if (( first )); then first=0; else printf ','; fi
+			# Subshell so per-MVP env vars don't leak between iterations.
+			(
+				set -a; . "$m"; set +a
+				local env base
+				if   [[ "$SLUG" == lab-*     ]]; then env="lab";     base="${SLUG#lab-}"
+				elif [[ "$SLUG" == staging-* ]]; then env="staging"; base="${SLUG#staging-}"
+				elif [[ "$SLUG" == qa-*      ]]; then env="qa";      base="${SLUG#qa-}"
+				else                                   env="prod";    base="$SLUG"
+				fi
+				# Emit https:// — ArvanCloud terminates HTTPS at the edge for
+				# proxied (cloud=ON) records. Broken HTTPS is safer than
+				# mixed-content warnings on the consumer page.
+				printf '{"slug":"%s","base":"%s","env":"%s","type":"%s","domain":"%s","url":"https://%s","current_tag":"%s"}' \
+					"$SLUG" "$base" "$env" "$TYPE" "$DOMAIN" "$DOMAIN" "${CURRENT_TAG:-}"
+			)
+		done
+		printf ']}\n'
+	} > "$tmp"
+	mv "$tmp" "$final"
+	chmod 644 "$final"
+}
+
 # ---------- subcommands: infra --------------------------------------------
 cmd_infra_install() {
 	# Wires /srv/infra so the infra compose can run from there while the
@@ -303,6 +353,7 @@ EOF
 			> "$SITES_DIR/$slug.caddy"
 	fi
 
+	regen_projects_json
 	ok "MVP '$slug' registered."
 	echo "  type:         $type"
 	echo "  domain:       $domain"
@@ -349,6 +400,7 @@ EOF
 
 	log "removing $app_dir"
 	rm -rf "$app_dir"
+	regen_projects_json
 	ok "MVP '$slug' removed."
 }
 
@@ -399,6 +451,7 @@ cmd_deploy() {
 
 	update_env_var "$app_dir/.meta" CURRENT_TAG "$tag"
 	append_deploy_log "$slug" "$tag" "$mode"
+	regen_projects_json
 
 	ok "$slug deployed @ $tag  →  https://$DOMAIN"
 }

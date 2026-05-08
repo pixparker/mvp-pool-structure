@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>hello-static · mvp-pool sample</title>
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <span class="kbd">mvp-pool</span>
+      <h1>hello from <em>hello-static</em></h1>
+      <p class="lede">A practice project for build-on-Hetzner deploys to an Iran VPS.</p>
+    </header>
+
+    <section class="card">
+      <h2>What this is</h2>
+      <p>
+        A minimal static site shaped to match the <code>static</code> template.
+        Edit <code>prototype/</code>, run <code>mvpool-local deploy</code>, and watch
+        the deploy land in your dashboard at
+        <code>http://localhost:8080</code>.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Currently deployed</h2>
+      <dl>
+        <dt>tag</dt><dd id="tag" class="mono">…</dd>
+        <dt>built</dt><dd id="built" class="mono">…</dd>
+        <dt>cache</dt><dd id="cache" class="mono">…</dd>
+        <dt>visiting from</dt><dd id="ua" class="mono">…</dd>
+      </dl>
+    </section>
+
+    <footer>
+      <a href="./version.txt">/version.txt</a>
+      <span>·</span>
+      <a href="https://github.com/anthropics/claude-code/issues/new">feedback</a>
+    </footer>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
