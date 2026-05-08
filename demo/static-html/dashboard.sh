@@ -28,6 +28,24 @@ case "${1:-}" in
         echo "[ok] tunnel closed"
         exit 0
         ;;
+    --reload|--refresh|--restart)
+        # Push the latest dashboard files to /srv/build/dashboard, then SIGKILL
+        # the running bun. systemd's Restart=on-failure + RestartSec=2 revives it
+        # within ~3s. Works without sudo because the bun process is owned by ali.
+        echo "[reload] syncing local dashboard/ to ${HOST}:/srv/build/dashboard/"
+        REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+        tar -cf - --exclude=node_modules -C "$REPO" dashboard 2>/dev/null \
+            | ssh "$HOST" 'tar -xf - -C /home/ali/mvp-pool-source && rsync -a --delete /home/ali/mvp-pool-source/dashboard/ /srv/build/dashboard/'
+        echo "[reload] kill -9 bun (systemd auto-restarts in ~3s)"
+        ssh "$HOST" 'pkill -9 -u ali bun || true'
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            code=$(curl -s --max-time 1 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${LOCAL_PORT:-8090}/healthz" 2>/dev/null || echo 000)
+            [[ "$code" == "200" ]] && break
+        done
+        echo "[reload] dashboard healthz: $code"
+        exit 0
+        ;;
 esac
 
 probe() { curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${LOCAL_PORT}/healthz" 2>/dev/null || echo "000"; }
