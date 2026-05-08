@@ -52,6 +52,7 @@ export default function App() {
   return (
     <main>
       <header>
+      <h1>Welcome!</h1>
         <span className="kbd">mvp-pool · react-app</span>
         <h1>React on <em>mvp-pool</em></h1>
         <p className="lede">

@@ -113,10 +113,11 @@ mvpool-local deploy "$SLUG" \
 TIME_END=$(date +%s)
 
 step "done · total ${SLUG} deploy: $((TIME_END - TIME_START))s"
-note "https:    https://${SLUG}.pagio.ir/      (ArvanCloud edge TLS)"
-note "version:  curl -s https://${SLUG}.pagio.ir/api/version"
-note "health:   curl -s https://${SLUG}.pagio.ir/health"
-note "echo:     curl -s https://${SLUG}.pagio.ir/api/echo"
+note "https:     https://${SLUG}.pagio.ir/      (ArvanCloud edge TLS)"
+note "version:   curl -s https://${SLUG}.pagio.ir/api/version"
+note "health:    curl -s https://${SLUG}.pagio.ir/health"
+note "echo:      curl -s https://${SLUG}.pagio.ir/api/echo"
+note "dashboard: mvpool-local ui     (opens deploy dashboard via SSH tunnel)"
 note ""
 note "If this was the first deploy of '${SLUG}', the ArvanCloud DNS record"
 note "is still propagating (TTL 120s). Wait a minute and retry HTTPS."

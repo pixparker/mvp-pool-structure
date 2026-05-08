@@ -490,6 +490,21 @@ ship_tarball_via_build_host() {
 	done
 }
 
+# ---------- ui (open the deploy dashboard) -------------------------------
+cmd_ui() {
+	# `mvpool-local ui` — open / refresh the deploy dashboard.
+	# Wraps dashboard/open.sh which establishes (or reuses) an SSH tunnel
+	# to the dashboard service on the build host and opens the browser.
+	#
+	# Sub-flags forward to dashboard/open.sh:
+	#   mvpool-local ui              # open
+	#   mvpool-local ui --close      # tear down the tunnel
+	#   mvpool-local ui --reload     # rsync local changes + kick bun + reopen
+	local script="${FRAMEWORK_ROOT}/../dashboard/open.sh"
+	[[ -x "$script" ]] || die "missing dashboard/open.sh at $script"
+	exec bash "$script" "$@"
+}
+
 # ---------- arvan:ensure -------------------------------------------------
 cmd_arvan_ensure() {
 	local slug="${1:-}"
@@ -672,6 +687,7 @@ main() {
 	case "$sub" in
 		deploy)            cmd_deploy "$@" ;;
 		verify)            cmd_verify "$@" ;;
+		ui|dashboard)      cmd_ui "$@" ;;
 		arvan:ensure)      cmd_arvan_ensure "$@" ;;
 		login)             cmd_login "$@" ;;
 		""|-h|--help|help) usage ;;
