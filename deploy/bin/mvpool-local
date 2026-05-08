@@ -307,6 +307,7 @@ cmd_deploy() {
 		size_mb=" · image=$(awk -v b="$MVPOOL_IMAGE_BYTES" 'BEGIN{printf "%.1f MB", b/1048576}')"
 	fi
 	ok "deployed $slug @ $tag — build=${MVPOOL_T_BUILD_S}s ship=${MVPOOL_T_SHIP_S}s start=${MVPOOL_T_START_S}s total=${MVPOOL_T_TOTAL_S}s${size_mb}"
+	log "  → https://${slug}.${POOL_DOMAIN}     (or run \`mvpool-local ui\` for the dashboard)"
 
 	# Verify the deployed URL actually answers + matches the tag we just shipped.
 	# Best-effort: don't fail the deploy if verification fails (the deploy
@@ -659,6 +660,16 @@ Special commands (run locally):
                               --mode tarball. Set MVPOOL_BUILD_HOST in your
                               config to make this the default; pass
                               --no-build-on to override back to local.
+  verify <slug> [--tag T]     Curl the deployed URL, parse /api/version or
+                              /version.txt, confirm the tag matches the one
+                              we expect to be live. Auto-runs at the end of
+                              every `deploy`; useful standalone to re-check.
+  ui [--reload|--close]       Open the deploy dashboard via an SSH tunnel
+                              to the build host. --reload pushes local
+                              dashboard/ changes + kicks the bun process.
+  arvan:ensure <slug>         Idempotently create the ArvanCloud A record
+                              for <slug>.${MVPOOL_ARVANCLOUD_DOMAIN} with
+                              cloud=ON. Auto-runs as part of `deploy`.
   login                       `docker login` to registry.${POOL_DOMAIN}.
 
 Everything else is forwarded to the server's `mvpool` over SSH:

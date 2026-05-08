@@ -37,7 +37,7 @@ if (( BG )); then
 	LOG="/tmp/mvpool-deploy-${JOB_ID}.log"
 	echo "[deploy] backgrounding — job ${JOB_ID}"
 	echo "  log:  tail -f ${LOG}"
-	echo "  ui:   bash demo/static-html/dashboard.sh   (opens http://localhost:8090)"
+	echo "  ui:   mvpool-local ui   (opens deploy dashboard, http://localhost:8090)"
 	echo "  url:  https://${SLUG}.${POOL_DOMAIN:-pagio.ir}"
 	clean_args=()
 	for a in "$@"; do

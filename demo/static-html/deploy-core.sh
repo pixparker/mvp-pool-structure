@@ -44,7 +44,7 @@ if (( BG )); then
 	LOG="/tmp/mvpool-deploy-${JOB_ID}.log"
 	echo "[deploy] backgrounding — job ${JOB_ID}"
 	echo "  log:  tail -f ${LOG}"
-	echo "  ui:   bash demo/static-html/dashboard.sh   (opens http://localhost:8090)"
+	echo "  ui:   mvpool-local ui   (opens deploy dashboard, http://localhost:8090)"
 	echo "  url:  https://${SLUG}.${POOL_DOMAIN:-pagio.ir}"
 	# Re-exec self in detached mode. Pass everything except --background flags.
 	clean_args=()
@@ -91,8 +91,9 @@ mvpool-local deploy "$SLUG" \
     --mode tarball
 
 step "done"
-note "https:    https://${SLUG}.pagio.ir/      (ArvanCloud edge TLS)"
-note "version:  curl -s https://${SLUG}.pagio.ir/version.txt"
+note "https:     https://${SLUG}.pagio.ir/      (ArvanCloud edge TLS)"
+note "version:   curl -s https://${SLUG}.pagio.ir/version.txt"
+note "dashboard: mvpool-local ui     (opens deploy dashboard via SSH tunnel)"
 note ""
 note "If HTTPS fails for a brand-new slug, the ArvanCloud DNS record is"
 note "still propagating (TTL 120s). Wait a minute, then retry."
