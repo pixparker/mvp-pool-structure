@@ -103,6 +103,7 @@ What this does:
 - (For non-static) Creates a Postgres role + database with a generated password, picks the next free Redis DB index (0–15), writes both into `.env`.
 - Writes a Caddy site snippet at `/srv/infra/sites/<slug>.caddy` binding the domain to the MVP's containers.
 - Defaults the domain to `<slug>.${POOL_DOMAIN}` (override with `--domain`).
+- Whatever ends up as `DOMAIN` in `/srv/apps/<slug>/.meta` is what `mvpool-local deploy` writes into the deployment record's `url` field — i.e., what the dashboard links to and what `mvpool-local verify` curls. So if your slug is hosted on a different zone (e.g. `lab.prototype.mizro.ir` while the pool is `pagio.ir`), pass `--domain lab.prototype.mizro.ir` and the dashboard / verify will point there automatically. Don't synthesize URLs in your wrapper scripts — the framework already knows.
 
 The MVP isn't running yet — the `IMAGE_TAG` in `.env` is the placeholder `bootstrap`, and no images exist for that tag. Move on to step 3.
 
