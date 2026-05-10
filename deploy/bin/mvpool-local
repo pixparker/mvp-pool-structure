@@ -37,6 +37,14 @@ ARVAN_TOKEN="${MVPOOL_ARVANCLOUD_API_TOKEN:-}"
 ARVAN_DOMAIN="${MVPOOL_ARVANCLOUD_DOMAIN:-}"
 ARVAN_ORIGIN_IP="${MVPOOL_ARVANCLOUD_ORIGIN_IP:-}"
 
+# Set by cmd_deploy after reading the slug's .meta DOMAIN, used by
+# deploy_record + verify + the post-deploy URL print. When a slug's
+# user-facing host lives outside POOL_DOMAIN (e.g. Mizro's prototype on
+# lab.prototype.mizro.ir while the pool runs under pagio.ir), this is the
+# canonical URL — not the synthesized <slug>.<POOL_DOMAIN>. Falls back to
+# <slug>.<POOL_DOMAIN> when empty.
+DEPLOY_PUBLIC_URL=""
+
 FRAMEWORK_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 TEMPLATES_DIR="$FRAMEWORK_ROOT/templates"
 
@@ -136,8 +144,14 @@ deploy_record() {
 	elif [[ "$slug" == qa-*      ]]; then env="qa";      base="${slug#qa-}"
 	else                                  env="prod";    base="$slug"
 	fi
+	# Prefer the canonical user-facing URL captured in .meta DOMAIN
+	# (set by cmd_deploy → public_url_for_slug). Synthesized fallback
+	# only kicks in for slugs that ride the default <slug>.<POOL_DOMAIN>
+	# convention.
 	url=""
-	[[ -n "${POOL_DOMAIN:-}" ]] && url="https://${slug}.${POOL_DOMAIN}"
+	if   [[ -n "${DEPLOY_PUBLIC_URL:-}" ]]; then url="$DEPLOY_PUBLIC_URL"
+	elif [[ -n "${POOL_DOMAIN:-}"       ]]; then url="https://${slug}.${POOL_DOMAIN}"
+	fi
 
 	# Build the metrics fragment. Emit only fields we have so old records
 	# with no metrics still parse cleanly.
@@ -216,6 +230,16 @@ cmd_deploy() {
 		[[ -n "$type" ]] || die "couldn't read TYPE from /srv/apps/$slug/.meta — pass --type or run mvpool mvp:add first"
 	fi
 	[[ -d "$TEMPLATES_DIR/$type" ]] || die "unknown --type '$type'"
+
+	# Capture the canonical user-facing URL once (.meta DOMAIN is set by
+	# `mvpool mvp:add --domain ...`). When unset, deploy_record falls back to
+	# the synthesized <slug>.<POOL_DOMAIN>. Reading the same .meta key would
+	# otherwise round-trip to the server on every status update.
+	local public_domain
+	public_domain="$(remote_meta_value "$slug" DOMAIN)"
+	if [[ -n "$public_domain" ]]; then
+		DEPLOY_PUBLIC_URL="https://${public_domain}"
+	fi
 
 	derive_pool_domain
 	local registry_host="registry.${POOL_DOMAIN}"
@@ -307,7 +331,7 @@ cmd_deploy() {
 		size_mb=" · image=$(awk -v b="$MVPOOL_IMAGE_BYTES" 'BEGIN{printf "%.1f MB", b/1048576}')"
 	fi
 	ok "deployed $slug @ $tag — build=${MVPOOL_T_BUILD_S}s ship=${MVPOOL_T_SHIP_S}s start=${MVPOOL_T_START_S}s total=${MVPOOL_T_TOTAL_S}s${size_mb}"
-	log "  → https://${slug}.${POOL_DOMAIN}     (or run \`mvpool-local ui\` for the dashboard)"
+	log "  → ${DEPLOY_PUBLIC_URL:-https://${slug}.${POOL_DOMAIN}}     (or run \`mvpool-local ui\` for the dashboard)"
 
 	# Verify the deployed URL actually answers + matches the tag we just shipped.
 	# Best-effort: don't fail the deploy if verification fails (the deploy
@@ -535,8 +559,17 @@ cmd_verify() {
 		esac
 	done
 
-	derive_pool_domain
-	local domain="${slug}.${POOL_DOMAIN}"
+	# Prefer the canonical .meta DOMAIN so verify hits whatever the slug is
+	# actually serving on (e.g. lab.prototype.mizro.ir), not the synthesized
+	# <slug>.<POOL_DOMAIN>. Falls back to the synthesized form only when
+	# .meta has no DOMAIN — the legacy default for slugs that ride the
+	# pool's own zone.
+	local domain
+	domain="$(remote_meta_value "$slug" DOMAIN)"
+	if [[ -z "$domain" ]]; then
+		derive_pool_domain
+		domain="${slug}.${POOL_DOMAIN}"
+	fi
 
 	if [[ -z "$expected" ]]; then
 		expected="$(remote_meta_value "$slug" CURRENT_TAG)"
