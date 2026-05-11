@@ -353,3 +353,79 @@ Update `deploy/docs/operations.md` Cloudflare references where appropriate. For 
 
 - **Auto-prefix Caddy site files with `http://`** at `mvp:add` time when running on a restricted-network pool. Until this lands, the manual edit (or a wrapper script — see `demo/static-html/deploy-prod.sh`) is required after each `mvp:add`.
 - **Document the wildcard fallback explicitly** in `deploy/docs/adding-an-mvp.md` so operators know that `<new-slug>.<pool-domain>` resolves out of the box for HTTP-only access, even if they forgot to add the specific proxied record.
+
+---
+
+## Field findings — Mizro per-app slug buildout (2026-05-12)
+
+Stood up four Mizro slugs on the pagio.ir pool (lab-prototype, lab-web-public, lab-web-panel, lab-api) over a few sessions. Field findings that affect the framework, not just Mizro:
+
+### 11. `mvpool-local` reports `exit 0` when ship/migrate fails mid-stream
+
+When the rsync from Hetzner → laptop drops (Iran link), or the SSH connection to Hetzner closes between `docker save` → `rsync`, **the script can return `exit 0` while leaving the deploy half-done**: image saved on the build host but never loaded on the pool; compose up never triggered. Dashboard records "live" but the slug is stale.
+
+**Workaround:** every wrapper should verify post-deploy via `/version.txt` or another tag-bearing endpoint, AND check `docker ps` on the pool, before reporting success.
+
+**Framework fix:** propagate `set -e` discipline through `ship_tarball_via_build_host`'s per-image loop so partial failures bubble up to the script's exit code. The `--partial` flag on rsync should also be retried in-loop (n=3) before giving up, since Iran-link drops are routine.
+
+### 12. `--from .` rsync grabs the working tree, not git HEAD
+
+When two developers are active on the same app, deploying while the other dev is mid-edit picks up a half-saved file. We hit this twice — TS errors that didn't exist on disk one minute later. The deploy fails inscrutably.
+
+**Workaround:** commit before deploying. Yes, this means git is a de-facto deploy precondition.
+
+**Framework fix:** add a `--from-git HEAD` (or default) mode that uses `git archive HEAD | tar -x` for the build context, so deploys always reflect a known commit. Today's behavior stays available as `--from <path>` for explicit override.
+
+### 13. `full-stack-queue` template builds images you may not need
+
+The `full-stack-queue` build path unconditionally builds api + web + worker. For projects that route web through a separate slug (Mizro splits `web-public` and `web-panel` into their own node-server slugs), the `web` image is built, shipped, and never referenced — pure waste (~80 MB per deploy on a slim build, more on a fat one).
+
+**Framework fix:** add `--services api,worker` (or similar) to `mvpool-local deploy` for `full-stack-queue` and `react-node-monorepo` types, so operators can build a subset. Defaults to all-services for backwards compat.
+
+### 14. Container-name collision on shared `mvpool_edge` network
+
+Multiple node-server slugs default their compose service name to `app` (matching the template). When two slugs share `mvpool_edge`, Docker DNS for `app` resolves ambiguously — Caddy's `reverse_proxy app:80` can hit the wrong slug's container. We hit this with `lab-prototype` serving on `lab-web-public.mizro.ir`.
+
+**Workaround:** every Mizro slug sets `container_name: <unique-name>` in its compose override and the Caddy snippet uses that unique name. Documented inline.
+
+**Framework fix:** the `node-server` template should default to `container_name: mvp-{{SLUG}}-app` (already implicit via compose's project naming, but worth making explicit so operators don't accidentally write `app:80` in their Caddy snippets). Even better: the rendered Caddy snippet should auto-reference the container name.
+
+### 15. Fat runtime images break Hetzner disk on multi-MVP buildout
+
+Operator-laptop builds on Iran-VPN had to skip `pnpm deploy --prod` (the npm-metadata fetch was unreliable). The fat-runtime workaround `COPY --from=build /app /app` ships the entire workspace including dev deps. With 4 Mizro slugs × 1.3 GB images × 5x the buildx cache, Hetzner's 38 GB filled at 99% and builds failed with `no space left on device`.
+
+**The fix:** on Hetzner (or any build host with clean npm reach), always use `pnpm deploy --prod` in the build stage and `COPY --from=build /pruned /app` in the runtime. Mizro images dropped 1.3 GB → 214 MB (~6x). Tarballs 285 MB → 65 MB. Bridge transfer reliability also went up dramatically (smaller payload = fewer drop windows).
+
+**Framework fix:** the `node-server`, `react-node-monorepo`, and `full-stack-queue` Dockerfile templates (currently operator-provided per-project) could ship reference slim Dockerfiles operators copy. Today each project writes its own; results vary.
+
+### 16. Iran-link rsync drops correlate with tarball size
+
+Empirically: tarballs > ~200 MB drop ~50% of the time on the Hetzner ↔ laptop leg over Shadowrocket'd VPN. Tarballs < ~80 MB succeed first try ~95% of the time. Slim images are the fix; until then, multiple retries via `--partial` are routine.
+
+**Framework follow-up:** mvpool-local could implement in-script retry with backoff (3 attempts) for both rsync legs. Currently the operator has to re-run the whole `mvpool-local deploy` after a drop. The `--partial` flag means the second-run rsync resumes (so retries are cheap), but the operator has to notice the drop first.
+
+### 17. `mvpool mvp:add --type full-stack-queue` JWT env naming
+
+The framework template generates `JWT_ACCESS_SECRET` + `JWT_REFRESH_SECRET` in `.env`. Mizro's `@mizro/config` package expects `JWT_SECRET` (singular). Naming gap; operator has to add the missing key by hand.
+
+**Resolution:** project-level concern, not framework. Documented for Mizro in [`digital-menu/deploy/docs/lessons-learned.md`](../../../digital-menu/deploy/docs/lessons-learned.md). The framework's choice is fine; project schemas should align (or vice versa). Noted here so future projects know to check.
+
+### 18. Slug-aware build cache pruning
+
+Per-slug buildx cache lives at `/srv/build/<slug>/.buildx-cache/`. With many slugs, this grows. The weekly cron prune is fine for steady-state; during heavy initial buildouts (when each retry adds layers), more aggressive pruning is needed.
+
+**Operator command for "free disk now":**
+
+```bash
+ssh hetzner '
+  docker buildx prune -af
+  docker system prune -af --volumes
+  rm -f /srv/build/.ship/*.tar.zst  # stale tarballs
+'
+```
+
+**Framework follow-up:** `mvpool-local deploy` could prune `.ship/` tarballs older than 7 days at the start of each deploy. Already runs on a weekly cron; this would tighten the window for active development.
+
+---
+
+These findings inform the next round of framework changes. Items 11, 12, 13, 16, 18 are framework-level patches; 14, 15 are template improvements; 17 is per-project schema discipline.
