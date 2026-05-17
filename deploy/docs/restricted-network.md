@@ -429,3 +429,83 @@ ssh hetzner '
 ---
 
 These findings inform the next round of framework changes. Items 11, 12, 13, 16, 18 are framework-level patches; 14, 15 are template improvements; 17 is per-project schema discipline.
+
+---
+
+## Field findings — Mizro Demo 1 prod-slug provisioning (2026-05-17)
+
+Provisioned the bundled production slug `mizro` on pagio.ir for Phase B of Demo 1 cutover prep. Three new framework patterns worth surfacing:
+
+### 19. `mvp:add` generates auto-HTTPS Caddy snippet that triggers ACME on unreachable hosts
+
+`mvpool mvp:add <slug> --type full-stack-queue --domain <host>` writes `/srv/infra/sites/<slug>.caddy` containing:
+
+```caddy
+<host> {                # no http:// prefix → automatic HTTPS
+    ...
+    reverse_proxy mvp-<slug>-api-1:4000
+    ...
+}
+```
+
+Caddy parses this and **immediately** attempts ACME provisioning on next reload. If the slug's DNS doesn't exist yet (Mizro's case: we provisioned the slug during Phase B prep with DNS deferred to Phase 5), ACME repeatedly fails to reach `<host>:80`, generating log noise and small ACME budget burn.
+
+**Operator workaround (post-provision):**
+
+```bash
+ssh pagio "rm /srv/infra/sites/${SLUG}.caddy && mvpool infra:reload-caddy"
+```
+
+The real Caddy snippet from `deploy/caddy/` gets staged at deploy time. Until then, no `<slug>.caddy` = no ACME attempts.
+
+**Framework follow-up:** `mvpool mvp:add` could accept `--no-caddy` (skip snippet generation), or write `http://<host> { ... }` by default (explicit HTTP, no ACME). The current default is sensible when operators are doing `mvp:add` + `mvp:deploy` back-to-back; less sensible for staged prep flows.
+
+### 20. `mvp:remove` doesn't clean up orphan containers from hardcoded compose-project names
+
+When the slug's compose.yaml hardcodes `name: mvp-<custom>` (not derived from the slug name), `mvpool mvp:remove <slug>` looks for compose project `mvp-<slug>` — finds nothing, returns success — leaves the actual `mvp-<custom>` containers orphaned.
+
+Hit this on the Mizro legacy `mizro-staging` slug, whose compose.yaml had `name: mvp-mizro` (set up before the per-app slug migration consolidated naming). Output:
+
+```
+[mvpool] stopping stack
+Warning: No resource found to remove for project "mvp-mizro-staging".
+...
+✓ MVP 'mizro-staging' removed.
+
+# But docker ps still showed 5 mvp-mizro-*-1 containers running.
+```
+
+**Operator workaround:** after every `mvp:remove`, explicitly check for orphans by slug fragment, then down by project name:
+
+```bash
+docker compose ls -a | grep "${SLUG_FRAGMENT}"
+docker compose -p mvp-<orphan-project> down
+```
+
+**Framework follow-up:** `mvp:remove` could read the compose's `name:` field (if present) and use that as the project filter for the cleanup `docker compose down`. Falls back to slug-derived name otherwise. One-line change in the cleanup helper.
+
+### 21. `.env` files lack trailing newlines — `echo X >> .env` corrupts the last line
+
+Patching env vars on an existing slug `.env` via `echo VAR=value >> .env` jams the new line onto the prior one if the file lacks a trailing newline:
+
+```
+SECRETS_ENCRYPTION_KEY=iiWT1Mu...QaoJWT_SECRET=3yR1LRE...
+                                ^^^^^^^^ append jammed onto prior line
+```
+
+Caught in the wild patching `JWT_SECRET` (the singular alias `@mizro/config` requires per field-finding #17) into Mizro's lab-web-publish slug `.env`.
+
+**Operator workaround:** defensive newline check before any `.env` append:
+
+```bash
+[ -z "$(tail -c 1 /srv/apps/${SLUG}/.env)" ] || echo "" >> /srv/apps/${SLUG}/.env
+echo "NEW_VAR=value" >> /srv/apps/${SLUG}/.env
+```
+
+Or use `printf "\nNEW_VAR=value\n" >>` which is robust either way.
+
+**Framework follow-up:** `mvp:add` could write `.env` files with a guaranteed trailing newline. One-line change in the template renderer. Costs nothing, eliminates the gotcha.
+
+---
+
+These three (#19, #20, #21) are framework-level patches when convenient. None block Mizro's Demo 1 cutover; workarounds documented in `digital-menu/deploy/docs/lessons-learned.md §9-12`. Field-finding #17 (`JWT_SECRET` naming) is now 3-strikes on the Mizro side — repeated enough to be worth a framework-vs-project alignment discussion.
