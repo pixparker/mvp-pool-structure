@@ -119,6 +119,74 @@ ssh user@pool-vps "docker images | grep <slug>"
 # delete by tag in the registry's storage volume, then run garbage-collect
 ```
 
+## Disk cleanup (`mvpool-local cleanup`)
+
+Build hosts (Hetzner et al.) and pool VPSes accumulate disk over time:
+old image tags from previous deploys, stale buildx cache layers, interrupted
+ship tarballs in `/tmp`, failed-build `ingest/` dirs. Left alone, a 38 GB
+build host will hit "no space left on device" mid-build every couple of
+weeks of active deployment (see Mizro's lessons-learned §11 + §22).
+
+The framework ships a unified cleanup command — single source of truth, no
+per-project scripts to maintain:
+
+```bash
+# Both hosts, dry-run first to see what would be deleted (no changes):
+mvpool-local cleanup --dry-run
+
+# Apply (default: --keep-days 7, both hosts):
+mvpool-local cleanup
+
+# Only the build host, more aggressive (keep 3 days):
+mvpool-local cleanup build --keep-days 3
+
+# Only the pool host:
+mvpool-local cleanup pool
+```
+
+### What it touches
+
+**Build host (Hetzner-side, via `MVPOOL_BUILD_HOST`):**
+- `/srv/build/.ship/*.tar.zst` older than `--keep-days N` → deleted
+- `/srv/build/*/.buildx-cache/ingest/*` dirs older than 60 minutes → deleted (these are remnants of failed cache exports; never useful)
+- `docker buildx prune --filter until=Nh` → reclaims buildkit's own cache
+- `docker image prune -a --filter until=Nh` → reclaims dangling + old tagged images
+
+**Pool host (`MVPOOL_HOST`):**
+- `docker image prune -a --filter until=Nh` → reclaims old image tags (auto-respects images referenced by running containers, so the live deploy is never touched)
+- `/tmp/*-*.tar.zst` older than 1 day → deletes interrupted-ship leftovers
+- `docker volume prune -f` → deletes only unreferenced volumes (no live data lost)
+
+### Safety guarantees
+
+- **Idempotent.** Re-running has no extra effect.
+- **Active containers protected.** Docker prune's behaviour: images referenced by ANY container (running or stopped) are never deleted. The N-day filter additionally skips anything recent.
+- **Rollback window preserved.** `--keep-days 7` keeps the last week's image tags; `mvpool rollback <slug> <tag>` continues to work for any tag within that window.
+- **Dry-run first when in doubt.** `--dry-run` lists candidates without touching anything.
+
+### Cadence
+
+Recommended cadence: **weekly**, before the deploy backlog starts to bite. Two options:
+
+**Manual:** Run from your laptop as part of Monday-morning housekeeping.
+
+**Cron (host-side):** drop a snippet onto either host. Example for the pool host's `/etc/cron.weekly/mvpool-cleanup`:
+
+```bash
+#!/bin/sh
+# Weekly mvpool cleanup — keep last 7 days of images.
+docker image prune -af --filter "until=168h" >/var/log/mvpool-cleanup.log 2>&1
+docker volume prune -f >>/var/log/mvpool-cleanup.log 2>&1
+find /tmp -maxdepth 1 -name '*-*.tar.zst' -mtime +1 -delete
+```
+
+Mirror to the build host. The CLI `mvpool-local cleanup` is the human-driven version; cron is the unattended version (mirrors the same operations).
+
+### When NOT to run cleanup
+
+- **Mid-deploy.** A deploy in flight has a freshly-loaded image not yet attached to a container. Wait until `mvpool status` shows the new tag as active.
+- **Right before a rollback investigation.** If you've lost trust in the current deploy and might roll back to a 7+ day-old tag, raise `--keep-days` before cleanup or skip cleanup until you've decided.
+
 ## Health checks
 
 `mvpool status` is the single-screen overview:

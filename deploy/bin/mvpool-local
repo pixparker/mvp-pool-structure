@@ -496,18 +496,32 @@ ship_tarball_via_build_host() {
 		fi
 
 		log "rsync $BUILD_ON_HOST -> laptop ($fname)"
+		# Resilient flags for Iran↔Hetzner↔laptop↔pagio drops (lessons-learned §24-§26):
+		#   --partial --inplace : on retry, resume via rsync's block-level delta
+		#                         (verifies block content, NOT just file size — safer
+		#                         than --append, which once corrupted a tarball on
+		#                         pagio because the prior-drop's partial bytes were
+		#                         trusted; cf. 2026-05-25 deploy postmortem)
+		#   --ignore-times      : force delta-checksum on every run (don't skip when
+		#                         destination has matching size+mtime — that gotcha
+		#                         hid a corrupt /tmp/$fname on pagio across 3 retries)
+		#   --timeout=120       : detect dead SSH socket in 2 min (default = infinite)
 		# shellcheck disable=SC2086
-		rsync -a --partial --progress \
+		rsync -a --partial --inplace --ignore-times --progress --timeout=120 \
 			-e "ssh $SSH_OPTS -p $BUILD_ON_PORT" \
 			"${BUILD_ON_HOST}:${remote_tar}" "$local_tar"
 
 		log "rsync laptop -> $SSH_HOST ($fname)"
 		# shellcheck disable=SC2086
-		rsync -a --partial --progress \
+		rsync -a --partial --inplace --ignore-times --progress --timeout=120 \
 			-e "ssh $SSH_OPTS -p $SSH_PORT" \
 			"$local_tar" "${SSH_HOST}:${pool_tar}"
 
 		log "loading on $SSH_HOST"
+		# Verify zstd integrity BEFORE docker load — fail fast with a clear error
+		# instead of confusing "Decoding error (36)" mid-load (cf. 2026-05-25
+		# postmortem where 3 retries loaded a corrupt tarball before we caught it).
+		remote_sh "zstd -t '$pool_tar' || { echo '[mvpool-local] tarball integrity check FAILED — refusing to load. Delete $pool_tar on $SSH_HOST and retry.' >&2; exit 36; }"
 		remote_sh "zstd -dc < '$pool_tar' | docker load && rm -f '$pool_tar'"
 
 		# Drop the laptop staging copy as we go to bound disk use on big multi-image deploys.
@@ -670,6 +684,146 @@ cmd_login() {
 	docker login "$registry_host" -u "$user"
 }
 
+# ---------- cleanup ------------------------------------------------------
+# Reclaim disk on the build host and/or pool host. Safe by design — uses
+# `docker --filter until=Nd` which respects images referenced by running
+# containers, and only touches tarballs older than mtime N days, so the
+# in-flight deploy's artefacts are never deleted.
+#
+# Usage:
+#   mvpool-local cleanup [build|pool|both]  (default: both)
+#       [--keep-days N]    (default: 7 — preserves N days of rollback)
+#       [--dry-run]        (list what would be deleted, change nothing)
+cmd_cleanup() {
+	local target="both"
+	local keep_days=7
+	local dry_run=0
+
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			build|pool|both) target="$1"; shift ;;
+			--keep-days)     keep_days="$2"; shift 2 ;;
+			--keep-days=*)   keep_days="${1#*=}"; shift ;;
+			--dry-run)       dry_run=1; shift ;;
+			-h|--help)
+				sed -n '/^# ---------- cleanup/,/^cmd_cleanup()/p' "$0" \
+					| sed 's|^# \?||' | head -n -1
+				return 0
+				;;
+			*) die "cleanup: unknown arg '$1'" ;;
+		esac
+	done
+
+	[[ "$keep_days" =~ ^[0-9]+$ ]] || die "cleanup: --keep-days must be an integer"
+
+	local dry_label=""
+	(( dry_run == 1 )) && dry_label=" [DRY-RUN]"
+
+	if [[ "$target" == "build" || "$target" == "both" ]]; then
+		[[ -n "$BUILD_ON_HOST" ]] || die "cleanup build: MVPOOL_BUILD_HOST not set"
+		log "cleanup build host (${BUILD_ON_HOST})${dry_label} — keep last ${keep_days} days"
+		_cleanup_build_host "$keep_days" "$dry_run"
+	fi
+
+	if [[ "$target" == "pool" || "$target" == "both" ]]; then
+		require_host
+		log "cleanup pool host (${SSH_HOST})${dry_label} — keep last ${keep_days} days"
+		_cleanup_pool_host "$keep_days" "$dry_run"
+	fi
+}
+
+# Cleanup script body — built as a heredoc so we can ship it to either host
+# and run it in a single SSH invocation (faster + atomic).
+_render_cleanup_script() {
+	local kind="$1"      # build | pool
+	local keep_days="$2"
+	local dry_run="$3"
+	# docker prune's `until` filter accepts Go duration (hours/minutes only —
+	# no `d` unit), so we convert days→hours here at render time.
+	local keep_hours=$(( keep_days * 24 ))
+
+	cat <<EOF
+set -u
+KEEP_DAYS=${keep_days}
+KEEP_HOURS=${keep_hours}
+DRY=${dry_run}
+EOF
+
+	if [[ "$kind" == "build" ]]; then
+		cat <<EOF
+echo "== disk before =="; df -h / | tail -1
+
+echo "== /srv/build/.ship tarballs (mtime > \${KEEP_DAYS}d) =="
+if [[ -d /srv/build/.ship ]]; then
+  find /srv/build/.ship -type f -name '*.tar.zst' -mtime +\${KEEP_DAYS} -printf '%s\t%p\n' | sort -nr | head -20 || true
+  if [[ \${DRY} -eq 0 ]]; then
+    find /srv/build/.ship -type f -name '*.tar.zst' -mtime +\${KEEP_DAYS} -delete
+  fi
+fi
+
+echo "== stale buildx ingest dirs (failed-build remnants) =="
+find /srv/build/*/.buildx-cache/ingest -maxdepth 1 -type d -mmin +60 2>/dev/null | head -10 || true
+if [[ \${DRY} -eq 0 ]]; then
+  find /srv/build/*/.buildx-cache/ingest -maxdepth 1 -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+fi
+
+echo "== docker buildx prune (older than \${KEEP_DAYS}d) =="
+if [[ \${DRY} -eq 0 ]]; then
+  docker buildx prune -af --filter "until=\${KEEP_HOURS}h" 2>&1 | tail -3
+else
+  docker buildx du 2>&1 | tail -5
+fi
+
+echo "== docker image prune (older than \${KEEP_DAYS}d, untouched-by-containers) =="
+if [[ \${DRY} -eq 0 ]]; then
+  docker image prune -af --filter "until=\${KEEP_HOURS}h" 2>&1 | tail -3
+else
+  docker images --filter "dangling=false" --format '{{.Repository}}:{{.Tag}} {{.CreatedSince}}' | head -20
+fi
+
+echo "== disk after =="; df -h / | tail -1
+EOF
+	else
+		cat <<EOF
+echo "== disk before =="; df -h / | tail -1
+
+echo "== docker image prune (older than \${KEEP_DAYS}d, untouched-by-containers) =="
+if [[ \${DRY} -eq 0 ]]; then
+  docker image prune -af --filter "until=\${KEEP_HOURS}h" 2>&1 | tail -3
+else
+  docker images --format '{{.Repository}}:{{.Tag}} {{.CreatedSince}}' | head -20
+fi
+
+echo "== /tmp ship tarballs (interrupted ships, mtime > 1d) =="
+if compgen -G '/tmp/*-*.tar.zst' >/dev/null 2>&1; then
+  find /tmp -maxdepth 1 -name '*-*.tar.zst' -mtime +1 -printf '%s\t%p\n' | sort -nr | head -10
+  if [[ \${DRY} -eq 0 ]]; then
+    find /tmp -maxdepth 1 -name '*-*.tar.zst' -mtime +1 -delete
+  fi
+fi
+
+echo "== docker volume prune (unreferenced only) =="
+if [[ \${DRY} -eq 0 ]]; then
+  docker volume prune -f 2>&1 | tail -3
+fi
+
+echo "== disk after =="; df -h / | tail -1
+EOF
+	fi
+}
+
+_cleanup_build_host() {
+	local keep_days="$1"
+	local dry_run="$2"
+	_render_cleanup_script build "$keep_days" "$dry_run" | build_sh bash
+}
+
+_cleanup_pool_host() {
+	local keep_days="$1"
+	local dry_run="$2"
+	_render_cleanup_script pool "$keep_days" "$dry_run" | remote_sh bash
+}
+
 # ---------- dispatch ------------------------------------------------------
 usage() {
 	cat <<'EOF'
@@ -703,6 +857,10 @@ Special commands (run locally):
   arvan:ensure <slug>         Idempotently create the ArvanCloud A record
                               for <slug>.${MVPOOL_ARVANCLOUD_DOMAIN} with
                               cloud=ON. Auto-runs as part of `deploy`.
+  cleanup [build|pool|both]   Reclaim disk on the build host and/or pool
+          [--keep-days N]     host. Safe — docker prune `until` filter
+          [--dry-run]         respects running containers; tarballs older
+                              than N days only. Default: both, keep-days=7.
   login                       `docker login` to registry.${POOL_DOMAIN}.
 
 Everything else is forwarded to the server's `mvpool` over SSH:
@@ -733,6 +891,7 @@ main() {
 		verify)            cmd_verify "$@" ;;
 		ui|dashboard)      cmd_ui "$@" ;;
 		arvan:ensure)      cmd_arvan_ensure "$@" ;;
+		cleanup)           cmd_cleanup "$@" ;;
 		login)             cmd_login "$@" ;;
 		""|-h|--help|help) usage ;;
 		# Catch-all: forward to the remote `mvpool` CLI. Allocate a TTY for
