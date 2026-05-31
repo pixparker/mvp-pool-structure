@@ -193,6 +193,7 @@ cmd_deploy() {
 	local static_root="" cache_mode=""
 	local api_df="Dockerfile.api" web_df="Dockerfile.web" worker_df="Dockerfile.worker"
 	local app_df="Dockerfile"
+	local load_only=0
 	while (($#)); do
 		case "$1" in
 			--from) from="$2"; shift 2 ;;
@@ -207,6 +208,13 @@ cmd_deploy() {
 			--web-dockerfile)    web_df="$2";    shift 2 ;;
 			--worker-dockerfile) worker_df="$2"; shift 2 ;;
 			--app-dockerfile)    app_df="$2";    shift 2 ;;
+			# Build + ship + docker-load on the pool, but stop BEFORE the
+			# remote `mvpool deploy` step that flips IMAGE_TAG + recreates
+			# containers. Used by batch-deploy orchestrators
+			# (e.g. digital-menu/deploy/deploy-prod-quick.sh) that want to
+			# ship every changed app first, THEN cut over them all in one
+			# tight window. Follow up with `mvpool-local cutover <slug> --tag T`.
+			--load-only)  load_only=1; shift ;;
 			-*) die "unknown flag: $1" ;;
 			*) [[ -z "$slug" ]] && slug="$1" || die "unexpected arg: $1"; shift ;;
 		esac
@@ -315,6 +323,17 @@ cmd_deploy() {
 	_t2="$(date +%s)"
 	export MVPOOL_T_SHIP_S=$(( _t2 - _t1 ))
 
+	if (( load_only == 1 )); then
+		# Stop after ship/load — caller is orchestrating a batch cutover and
+		# will run `mvpool-local cutover <slug> --tag <tag>` when ready.
+		export MVPOOL_T_START_S=0
+		export MVPOOL_T_TOTAL_S=$(( _t2 - _t0 ))
+		deploy_record_with_track "loaded"
+		ok "$slug @ $tag loaded on pool (image ready; no cutover yet)"
+		log "  → run \`mvpool-local cutover $slug --tag $tag\` to swap containers"
+		return 0
+	fi
+
 	# Trigger remote deploy.
 	log "$slug: triggering remote deploy"
 	remote_sh "mvpool deploy $slug --tag $tag --mode $mode"
@@ -338,6 +357,34 @@ cmd_deploy() {
 	# itself succeeded); just warn loudly. The 'verify-failed' record lets the
 	# dashboard surface the issue.
 	cmd_verify "$slug" --tag "$tag" || warn "$slug: post-deploy verification failed — site may not be reachable yet"
+}
+
+# ---------- cutover -------------------------------------------------------
+# Pair to `deploy --load-only`. SSH to the pool, run the same remote
+# `mvpool deploy` that the normal deploy would trigger — but since the image
+# is already loaded (by an earlier --load-only run), this is fast: it just
+# updates IMAGE_TAG in /srv/apps/<slug>/.env and recreates the containers.
+#
+# Usage: mvpool-local cutover <slug> --tag <tag>
+cmd_cutover() {
+	local slug="" tag=""
+	while (($#)); do
+		case "$1" in
+			--tag) tag="$2"; shift 2 ;;
+			-*) die "unknown flag: $1" ;;
+			*) [[ -z "$slug" ]] && slug="$1" || die "unexpected arg: $1"; shift ;;
+		esac
+	done
+	[[ -n "$slug" && -n "$tag" ]] || die "usage: mvpool-local cutover <slug> --tag <tag>"
+	require_host
+
+	log "cutover $slug → $tag"
+	# `--mode tarball` on the remote: skip docker pull (image was already
+	# loaded by the earlier `--load-only` ship). Remote just writes
+	# IMAGE_TAG to .env + `docker compose up -d` which recreates any
+	# container whose image reference changed.
+	remote_sh "mvpool deploy $slug --tag $tag --mode tarball" || die "$slug: cutover failed"
+	ok "$slug @ $tag is live"
 }
 
 build_static() {
@@ -847,6 +894,15 @@ Special commands (run locally):
                               --mode tarball. Set MVPOOL_BUILD_HOST in your
                               config to make this the default; pass
                               --no-build-on to override back to local.
+  deploy ... --load-only      Skip the final compose recreate step — leave
+                              the image loaded on the pool but don't switch
+                              containers yet. Used by batch-deploy
+                              orchestrators that want to ship every changed
+                              app first, then atomically cut over. Pair with
+                              `cutover` below.
+  cutover <slug> --tag T      Pair to `deploy --load-only`. Swap the
+                              container(s) of <slug> to the already-loaded
+                              <tag>. Fast (~5s) — no build, no ship.
   verify <slug> [--tag T]     Curl the deployed URL, parse /api/version or
                               /version.txt, confirm the tag matches the one
                               we expect to be live. Auto-runs at the end of
@@ -888,6 +944,7 @@ main() {
 	local sub="${1:-}"; shift || true
 	case "$sub" in
 		deploy)            cmd_deploy "$@" ;;
+		cutover)           cmd_cutover "$@" ;;
 		verify)            cmd_verify "$@" ;;
 		ui|dashboard)      cmd_ui "$@" ;;
 		arvan:ensure)      cmd_arvan_ensure "$@" ;;

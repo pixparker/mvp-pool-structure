@@ -187,6 +187,63 @@ Mirror to the build host. The CLI `mvpool-local cleanup` is the human-driven ver
 - **Mid-deploy.** A deploy in flight has a freshly-loaded image not yet attached to a container. Wait until `mvpool status` shows the new tag as active.
 - **Right before a rollback investigation.** If you've lost trust in the current deploy and might roll back to a 7+ day-old tag, raise `--keep-days` before cleanup or skip cleanup until you've decided.
 
+## Batched deploys (`--load-only` + `cutover`)
+
+Most slugs deploy independently, but when you ship several at once (e.g.
+a daily multi-app release), letting each deploy go fully end-to-end means
+the user-facing surfaces are in a mixed-version state during the run:
+api on tag N, web-panel still on N-1, etc. for ~10-30 min while builds
+and ships chain through.
+
+The framework supports a two-phase pattern that keeps the cutover window
+tight (~5s × number of slugs) by separating ship-the-image from
+swap-the-container:
+
+**Phase A — build, ship, load (per slug, but never recreate):**
+```bash
+mvpool-local deploy <slug> --from <path> --type <T> --tag <TAG> --load-only [other flags]
+```
+Same as a normal `deploy`, except the final `mvpool deploy` (which writes
+`IMAGE_TAG` to `/srv/apps/<slug>/.env` + recreates the containers) is
+skipped. The new image is `docker load`-ed onto the pool but no container
+is using it yet. Production is unaffected.
+
+Run this once per slug in your batch. Any failure here is non-destructive:
+the previously-deployed containers keep running on their old tags.
+
+**Phase B — atomic cutover (once every slug in the batch has loaded):**
+```bash
+mvpool-local cutover <slug> --tag <TAG>
+```
+Single short SSH call. Updates `IMAGE_TAG` + `docker compose up -d`
+(which recreates any container whose image reference changed). ~5s
+per slug; usable in tight succession to swap many slugs in ~25-30s
+total.
+
+### When NOT to use this pattern
+
+- Single-slug deploys — the normal `mvpool-local deploy` is simpler.
+- When phase-A might fail mid-batch but you want partial progress —
+  you'd rather use the normal per-slug deploy so each commit cuts over
+  as soon as it's ready.
+- When the new image requires a corresponding migration that must run
+  BEFORE the cutover. Run migrations explicitly between A and B (the
+  api's `migrate` container, or your project's equivalent).
+
+### Example: digital-menu's `deploy-prod-quick.sh`
+
+Mizro's daily prod-deploy wrapper uses this pattern. See
+`digital-menu/deploy/deploy-prod-quick.sh` for a reference orchestrator
+that:
+
+1. SSH-discovers each slug's currently-deployed tag
+2. Diffs HEAD against each tag → builds a "what changed" plan
+3. Confirms with the operator
+4. Runs phase A serially across changed apps (build serializes on the
+   single buildkit instance anyway, so parallel doesn't help)
+5. Runs phase B in api → web order to keep downstream apps happy
+6. Verifies all surfaces respond healthy
+
 ## Health checks
 
 `mvpool status` is the single-screen overview:
