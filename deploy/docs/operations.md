@@ -254,3 +254,7 @@ that:
 - Disk usage on `/srv`.
 
 Run periodically (manual or via cron + alerting). Each per-MVP compose has its own healthcheck for the web/api containers — failures show up in `docker compose ps`.
+
+## Suspecting a silent-success bug?
+
+When a deploy claims ✅ but the served app didn't change, OR when smoke passes but customers report stale behaviour, you're in silent-success territory. Read [silent-success-patterns.md](silent-success-patterns.md) — nineteen defensive rules from real incidents, each with the anti-pattern and the fix. Apply Rule 4 (version-baked smoke) first; it catches the most cases.

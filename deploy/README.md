@@ -93,6 +93,8 @@ All work over SSH via `mvpool-local <subcommand>` from your laptop.
 
 See [docs/operations.md](docs/operations.md) for backups, rollback semantics, Cloudflare modes, and disaster recovery.
 
+**Building anything new on top of this framework?** Read [docs/silent-success-patterns.md](docs/silent-success-patterns.md) first — defensive rules from real silent-success incidents (the worst bug class in any deploy pipeline). Generalisable to any pipeline, not mvpool-specific.
+
 ## Deploy flows
 
 Two paths supported:
