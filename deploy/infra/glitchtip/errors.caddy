@@ -1,0 +1,30 @@
+# GlitchTip — self-hosted error tracking (MVP-E28-F17). Copy into the shared
+# Caddy sites dir (bind-mounted as /etc/caddy/sites/*.caddy) and reload Caddy:
+#   cp errors.caddy /srv/infra/sites/errors.caddy   # path per your pool layout
+#   docker compose -f deploy/infra/compose.yaml exec caddy caddy reload --config /etc/caddy/Caddyfile
+# Auto-TLS is handled by the pool ACME config in the root Caddyfile.
+#
+# Dashboard auth: GlitchTip's own login gates the dashboard (open registration is
+# disabled — invite only), so there is deliberately NO Caddy basic_auth here: a
+# blanket basic_auth would also block the SDK ingest endpoints (browsers cannot
+# send basic-auth credentials), breaking error reporting. To further lock down
+# the dashboard, add an IP allowlist scoped to the NON-ingest paths only (see
+# README §6) — never to /api/<project>/(store|envelope|security).
+
+errors.mizro.ir {
+	encode zstd gzip
+	log {
+		output stdout
+		format console
+	}
+
+	# Browsers POST events to the DSN ingest API (public-key authenticated); the
+	# dashboard + REST API are served from the same origin and gated by GlitchTip
+	# login. `glitchtip-web` is the service's network alias on mvpool_edge.
+	reverse_proxy glitchtip-web:8080 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}

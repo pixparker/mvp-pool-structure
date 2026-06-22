@@ -1,0 +1,79 @@
+name: mvpool-glitchtip
+
+# Self-hosted GlitchTip — Sentry-protocol-compatible client error tracking for
+# the MVP pool (MVP-E28-F17). ONE shared instance ingests browser errors from
+# every app (digital-menu web-panel / web-ops / web-publish, future MVPs).
+# Iran-friendly: runs on our own infra, so no Sentry-SaaS IP blocks and no data
+# leaving our jurisdiction.
+#
+# Reuses the pool's shared Postgres + Redis (external `mvpool_data`) and is
+# fronted by the shared Caddy (external `mvpool_edge`) at errors.mizro.ir.
+# Service names are GlitchTip-prefixed so their network aliases don't collide
+# with other stacks' generic `web`/`worker` on the shared networks.
+#
+# Bring-up (after the infra `data` profile is up + the glitchtip DB exists —
+# see README):
+#   docker compose --env-file .env up -d
+# `glitchtip-migrate` runs DB migrations once then exits; `glitchtip-web` serves
+# the dashboard + the DSN ingest API; `glitchtip-worker` runs celery (event
+# processing + the scheduled retention purge).
+
+x-glitchtip-env: &glitchtip-env
+  DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+  REDIS_URL: ${REDIS_URL:?set REDIS_URL in .env}
+  SECRET_KEY: ${SECRET_KEY:?generate one — see README §3}
+  GLITCHTIP_DOMAIN: ${GLITCHTIP_DOMAIN:?e.g. https://errors.mizro.ir}
+  # Worker purges events older than this (retention policy, documented in the
+  # client-observability architecture doc).
+  GLITCHTIP_MAX_EVENT_LIFE_DAYS: ${GLITCHTIP_MAX_EVENT_LIFE_DAYS:-90}
+  # Invite-only: no public signup on an internal tool. Operator creates the
+  # founder account via the migrate step (README §5).
+  ENABLE_OPEN_USER_REGISTRATION: "false"
+  EMAIL_URL: ${EMAIL_URL:-consolemail://}
+  DEFAULT_FROM_EMAIL: ${DEFAULT_FROM_EMAIL:-errors@mizro.ir}
+  PORT: "8080"
+
+services:
+  glitchtip-migrate:
+    image: glitchtip/glitchtip:${GLITCHTIP_IMAGE_TAG:?pin a tag in .env}
+    # Django migration runner. One-shot — `web`/`worker` wait for it to finish
+    # cleanly. (Verify the entrypoint against the pinned image's docs; older
+    # tags used `./bin/run-migrate.sh`.)
+    command: ./manage.py migrate
+    environment: *glitchtip-env
+    networks: [data]
+    restart: "no"
+
+  glitchtip-web:
+    image: glitchtip/glitchtip:${GLITCHTIP_IMAGE_TAG:?pin a tag in .env}
+    restart: unless-stopped
+    environment: *glitchtip-env
+    networks: [edge, data]
+    depends_on:
+      glitchtip-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/_health/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  glitchtip-worker:
+    image: glitchtip/glitchtip:${GLITCHTIP_IMAGE_TAG:?pin a tag in .env}
+    # Celery worker + beat (event ingestion processing + scheduled retention
+    # cleanup). Needs only the data network (no public ingress).
+    command: ./bin/run-celery-with-beat.sh
+    restart: unless-stopped
+    environment: *glitchtip-env
+    networks: [data]
+    depends_on:
+      glitchtip-migrate:
+        condition: service_completed_successfully
+
+networks:
+  edge:
+    external: true
+    name: mvpool_edge
+  data:
+    external: true
+    name: mvpool_data
