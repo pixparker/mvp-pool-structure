@@ -18,6 +18,22 @@ errors.mizro.ir {
 		format console
 	}
 
+	# CORS allowlist — first-party *.mizro.ir browser origins only (CTO review).
+	# The DSN public key ships in the panel./ops. client bundles, so it's readable
+	# by anyone; this stops a THIRD-PARTY site's JavaScript from POSTing events to
+	# our instance. We reject by Origin at the edge rather than rewriting CORS
+	# headers (simpler + can't break ingestion):
+	#   · no Origin header  → server-side SDK (Node/edge)   → always passes.
+	#   · Origin *.mizro.ir → panel./ops. browser events    → passes.
+	#   · any other Origin  → foreign site                  → 403, never hits app.
+	# web-publish is observed server/edge-only, so the published menu sends no
+	# browser events here at all.
+	@foreign_origin {
+		header Origin *
+		not header Origin *.mizro.ir
+	}
+	respond @foreign_origin 403
+
 	# Browsers POST events to the DSN ingest API (public-key authenticated); the
 	# dashboard + REST API are served from the same origin and gated by GlitchTip
 	# login. `glitchtip-web` is the service's network alias on mvpool_edge.

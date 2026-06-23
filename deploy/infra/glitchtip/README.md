@@ -71,9 +71,29 @@ docker compose --env-file .env exec glitchtip-web ./manage.py createsuperuser
 Then in the dashboard:
 1. Create an **Organization** (e.g. `mizro`).
 2. Create a **Project per app** — `web-panel`, `web-ops`, `web-publish` (platform: `JavaScript`).
+   (The project slugs match the per-app `SENTRY_PROJECT` default in each
+   `next.config.ts`, so source-map upload lands in the right project.)
 3. Copy each project's **DSN** (Settings → Client Keys). That's what the SDK needs.
 
 Hand the three DSNs back for the app wiring (`NEXT_PUBLIC_GLITCHTIP_DSN` per app).
+
+> Note: `web-publish` (the published menu) is wired **server/edge-only** — no
+> browser DSN is used there (hard initial-JS/LCP budget). Its project still
+> receives server-side render/data errors. Only `web-panel` + `web-ops` send
+> browser events.
+
+### 6a. Disable IP storage per project — REQUIRED before founder G3 (CTO review)
+
+The client SDK runs `sendDefaultPii: false` and our scrubber drops `user.ip_address`,
+but GlitchTip still derives the **connecting IP** from the ingest request and would
+store it unless told not to. For **each** project:
+
+> Settings → **General Settings** → turn **“Store IP Addresses” OFF** → Save.
+
+(Org owners can also set this as an org default.) Verify by triggering a test error
+and confirming the event detail shows **no IP** under the user/context panel. If
+this is left on, raw diner/merchant IPs reach the dashboard regardless of the
+client-side config — see §9.
 
 **Dashboard hardening (optional):** GlitchTip login already gates the dashboard.
 For an extra layer, add an IP allowlist in `errors.caddy` scoped to the dashboard
@@ -93,9 +113,32 @@ paths only — never to `/api/<project>/store/`, `/api/<project>/envelope/`, or
 ## 8. Notes
 
 - Ingest CORS: GlitchTip's ingest endpoints accept cross-origin browser POSTs by
-  design (DSN public-key auth). If a future app origin is rejected, set
-  `ADDITIONAL_CORS_ORIGINS` in `.env` and recreate.
+  design (DSN public-key auth). We restrict that to first-party origins at the
+  **edge** — `errors.caddy` 403s any request whose `Origin` isn't `*.mizro.ir`
+  (server-side events have no `Origin` and pass). So no `ADDITIONAL_CORS_ORIGINS`
+  tuning is needed; to add a new first-party app, no change is required (it's
+  already under `*.mizro.ir`). A non-mizro origin is rejected by design.
 - Entrypoints (`./manage.py migrate`, `./bin/run-celery-with-beat.sh`) match
   current GlitchTip images; verify against the pinned tag's docs if a future bump
   changes them.
-- See the app-side design + privacy policy: `digital-menu/docs/architecture/27-client-observability.md`.
+- See the app-side design + privacy policy: `digital-menu/docs/architecture/28-client-observability.md`.
+
+## 9. Privacy gates — verify before founder G3 (CTO review)
+
+Two infra checks beyond the app-side redaction list (`@mizro/observability`):
+
+1. **IP not stored** — §6a done for every project. Confirm a test event shows no IP.
+2. **CORS allowlist live** — after installing `errors.caddy`, confirm a foreign
+   origin is rejected and a first-party one is accepted:
+
+   ```sh
+   # Foreign origin → 403
+   curl -s -o /dev/null -w '%{http_code}\n' -H 'Origin: https://evil.example' \
+     https://errors.mizro.ir/api/1/envelope/
+   # First-party origin → NOT 403 (reaches GlitchTip; 400/401 from the app is fine)
+   curl -s -o /dev/null -w '%{http_code}\n' -H 'Origin: https://panel.mizro.ir' \
+     https://errors.mizro.ir/api/1/envelope/
+   ```
+
+The founder G3 deliberate-error check then confirms the dashboard payload contains
+**zero** of: a real phone, a magic-link token, a phantom-user label, an IP.
