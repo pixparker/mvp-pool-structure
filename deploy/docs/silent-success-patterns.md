@@ -351,13 +351,28 @@ The script had been calling this non-existent function for weeks. Earlier failur
 
 ---
 
+## Rule 20 — Single-shot probes after container recreate measure cold-start latency, not deployment correctness
+
+**Anti-pattern:** Post-cutover, the verifier polls each new container's endpoint once with a short timeout. A container that's *up* but whose specific route isn't yet bound (Node/Next.js still mounting handlers, Caddy `reverse_proxy` connection-pool reset on upstream restart, init-order race) returns curl-code `000` — connection failure, indistinguishable from "app is broken". The single probe records a failure; the smoke gate flags the deploy red even though it's healthy. Repeated retries minutes later succeed cleanly.
+
+**Real incident (2026-06-05 + 06, Mizro — same shape twice in 24h):** Probe fired ~35s after web-ops + web-panel container recreate. Both returned `000000` (curl couldn't connect). Manual `curl -sI` against the same URL minutes later returned 200. The deploy was fine; the smoke check measured "container not warm enough yet". Telegram channel flagged red ❌ on a perfectly healthy deploy — eroded operator trust, and the version-baked smoke gate (Rule 4) effectively went unused on the actually-deployed bits.
+
+**Fix:**
+- Retry with backoff. 3 attempts at 0s / 8s / 16s gives ~25s tolerance per app; healthy fast-path is still one round-trip. For genuinely broken apps, all 3 attempts fail and smoke flags red — distinguishable from cold-start.
+- Differentiate "route doesn't exist" (terminal — log "skipped" and move on) from "transient connection failure" (retry-worthy). One heuristic: probe `/health` first — if `/health` 200s but the specific endpoint doesn't, retry. If `/health` doesn't 200, the app itself is broken.
+- The arbitrary `sleep 5` between cutover and smoke is fragile across apps (Node static-site vs Hono API vs Caddy-only have very different warm-up profiles). Replace with poll-until-ready on `/health` (every 2s up to 30s) before starting smoke proper.
+
+**Generalised:** A single-shot probe right after a container recreate measures cold-start latency more than deployment correctness. The fix is retry, not longer sleep — the fast path stays cheap, the slow path stays robust.
+
+---
+
 ## The meta-pattern: defence-in-depth catches what loud failures don't
 
 The 2026-06-02/03 incidents all shared a shape: **one layer claimed success without doing the work; downstream layers had no way to know**. Each rule is one more independent verifier:
 
 - Rules 1, 3, 12, 17: exit codes / parsers / constants / build-script per-app conditionals can lie → verify side effects against single sources of truth
 - Rules 2, 6, 15, 16: per-item checks can be empty / gates that exist on one path only / failure state that doesn't advance the polling guard → tail invariants + log idempotent decisions + advance state on EVERY terminal outcome
-- Rules 4, 18: liveness/smoke checks lie when they pass for the wrong version or hit an auth gate → version-baked + auth-bypassed smoke targets
+- Rules 4, 18, 20: liveness/smoke checks lie when they pass for the wrong version, hit an auth gate, or probe a cold container once → version-baked + auth-bypassed smoke targets + retry-with-backoff
 - Rules 5, 11: configuration AND dependencies can drift silently → drift detection
 - Rule 7: parallel runs interleave → correlation IDs
 - Rules 8, 9, 10, 19: error-handling code paths / systemd sandbox / `set -u` array access / f-string escape — runtime environment quietly diverges from the shell that wrote the code
