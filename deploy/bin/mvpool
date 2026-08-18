@@ -73,7 +73,72 @@ render_template() {
 		content="${content//\{\{${key}\}\}/${val}}"
 		shift
 	done
-	printf '%s' "$content"
+	# The trailing '\n' is load-bearing: `$(<"$tpl")` strips the file's final
+	# newline, and .env is rendered by APPENDING env.api.tpl to env.common.tpl.
+	# Without it the two collide and you get
+	#   PUBLIC_URL=https://slug.pagio.ir# Appended to the per-MVP .env when…
+	# — a corrupt value that only bites the first app to actually read it.
+	printf '%s\n' "$content"
+}
+
+# The Caddy site address line for a DOMAIN, which may name SEVERAL hosts as a
+# comma-separated list (`game.x.ir, go.x.ir` — one slug, one container, two
+# names).
+#
+# 🔒 Every host gets an explicit `http://`. TLS terminates at the ArvanCloud
+# edge, which speaks plain HTTP to this origin; a bare host makes Caddy enable
+# auto-HTTPS and 308 to itself, and the edge follows it into an infinite loop
+# while the container behind it is perfectly healthy. Prefixing only the first
+# host of a list is the same bug wearing a disguise — it is why this is a
+# function and not a `http://` in three templates.
+site_address() {
+	local out="" host
+	local IFS=,
+	for host in $1; do
+		host="${host#"${host%%[![:space:]]*}"}"   # ltrim
+		host="${host%"${host##*[![:space:]]}"}"   # rtrim
+		[[ -n "$host" ]] || continue
+		[[ "$host" == http://* || "$host" == https://* ]] || host="http://$host"
+		out="${out:+$out, }$host"
+	done
+	printf '%s' "$out"
+}
+
+# The first host of a (possibly multi-host) DOMAIN — what https:// URLs in
+# .env should name.
+primary_host() {
+	local first="${1%%,*}"
+	first="${first#"${first%%[![:space:]]*}"}"
+	first="${first%"${first##*[![:space:]]}"}"
+	printf '%s' "${first#http://}"
+}
+
+# Re-render <slug>'s Caddy site file from its .meta. Used by mvp:add and
+# mvp:set-domain so there is exactly one place that knows the shape.
+render_site() {
+	local slug="$1" type="$2" domain="$3" app_port="${4:-4000}"
+	local addr; addr=$(site_address "$domain")
+	case "$type" in
+		static)
+			render_template "$TEMPLATES_DIR/_shared/caddy-site.static.tpl" \
+				"SITE_ADDRESS=$addr" \
+				"WEB_HOST=mvp-${slug}-web-1" \
+				> "$SITES_DIR/$slug.caddy"
+			;;
+		node-server)
+			render_template "$TEMPLATES_DIR/_shared/caddy-site.node-server.tpl" \
+				"SITE_ADDRESS=$addr" \
+				"APP_HOST=mvp-${slug}-app-1" "APP_PORT=$app_port" \
+				> "$SITES_DIR/$slug.caddy"
+			;;
+		*)
+			render_template "$TEMPLATES_DIR/_shared/caddy-site.api-web.tpl" \
+				"SITE_ADDRESS=$addr" \
+				"API_HOST=mvp-${slug}-api-1" "API_PORT=4000" \
+				"WEB_HOST=mvp-${slug}-web-1" "WEB_PORT=80" \
+				> "$SITES_DIR/$slug.caddy"
+			;;
+	esac
 }
 
 compose_mvp() {
@@ -241,10 +306,16 @@ allocate_redis_db() {
 }
 
 cmd_mvp_add() {
-	# mvpool mvp:add <slug> [--type T] [--domain D] [--no-db] [--no-redis]
-	#                       [--db-name N] [--db-user U] [--redis-db N]
-	# Defaults: type=react-node-monorepo, domain=<slug>.${POOL_DOMAIN}.
-	local slug="" type="react-node-monorepo" domain=""
+	# mvpool mvp:add <slug> [--type T] [--domain D] [--port N] [--no-db]
+	#                       [--no-redis] [--db-name N] [--db-user U] [--redis-db N]
+	# Defaults: type=react-node-monorepo, domain=<slug>.${POOL_DOMAIN}, port=4000.
+	#
+	# --port is the container port Caddy proxies to for `node-server`. It
+	# defaults to 4000 (the API convention), but a Next.js standalone server
+	# listens on 80 — and a site file pointing at 4000 in front of a healthy
+	# container on 80 is a 502 that looks nothing like a port mismatch.
+	# --domain takes a comma-separated list to give one slug several hostnames.
+	local slug="" type="react-node-monorepo" domain="" app_port="4000"
 	local db_name="" db_user="" redis_db=""
 	local want_db=auto want_redis=auto
 
@@ -252,6 +323,7 @@ cmd_mvp_add() {
 		case "$1" in
 			--type) type="$2"; shift 2 ;;
 			--domain) domain="$2"; shift 2 ;;
+			--port) app_port="$2"; shift 2 ;;
 			--no-db) want_db=no; shift ;;
 			--no-redis) want_redis=no; shift ;;
 			--db-name) db_name="$2"; shift 2 ;;
@@ -261,14 +333,15 @@ cmd_mvp_add() {
 			*) [[ -z "$slug" ]] && slug="$1" || die "unexpected arg: $1"; shift ;;
 		esac
 	done
-	[[ -n "$slug" ]] || die "usage: mvpool mvp:add <slug> [--type T] [--domain D]"
+	[[ -n "$slug" ]] || die "usage: mvpool mvp:add <slug> [--type T] [--domain D] [--port N]"
 	[[ -d "$TEMPLATES_DIR/$type" ]] || die "unknown --type '$type' (have: $(ls "$TEMPLATES_DIR" | grep -v ^_ | tr '\n' ' '))"
+	[[ "$app_port" =~ ^[0-9]+$ ]] || die "--port must be a number, got '$app_port'"
 	require_infra
 	load_infra_env
 
 	# slug must be a safe DNS label.
 	[[ "$slug" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]] || die "slug must be lowercase alphanumeric/dash, <=41 chars"
-	[[ ! -d "$APPS_DIR/$slug" ]] || die "MVP '$slug' already exists at $APPS_DIR/$slug"
+	[[ ! -d "$APPS_DIR/$slug" ]] || die "MVP '$slug' already exists at $APPS_DIR/$slug. To change its hostname use: mvpool mvp:set-domain $slug <domain>"
 
 	[[ -n "$domain" ]] || domain="${slug}.${POOL_DOMAIN}"
 	[[ -n "$db_name" ]] || db_name="${slug//-/_}"
@@ -330,6 +403,7 @@ EOF
 SLUG=$slug
 TYPE=$type
 DOMAIN=$domain
+APP_PORT=$app_port
 DB_NAME=${db_name}
 DB_USER=${db_user}
 REDIS_DB_INDEX=${redis_db:-}
@@ -341,29 +415,9 @@ EOF
 
 	# 6. Caddy site snippet. Pick template by MVP shape:
 	#    - static          → one nginx container on :80 (whole site)
-	#    - node-server     → one app container on :4000 (whole site)
+	#    - node-server     → one app container on :$APP_PORT (whole site)
 	#    - react-node-monorepo / full-stack-queue → api on :4000 + web on :80
-	case "$type" in
-		static)
-			render_template "$TEMPLATES_DIR/_shared/caddy-site.static.tpl" \
-				"DOMAIN=$domain" \
-				"WEB_HOST=mvp-${slug}-web-1" \
-				> "$SITES_DIR/$slug.caddy"
-			;;
-		node-server)
-			render_template "$TEMPLATES_DIR/_shared/caddy-site.node-server.tpl" \
-				"DOMAIN=$domain" \
-				"APP_HOST=mvp-${slug}-app-1" "APP_PORT=4000" \
-				> "$SITES_DIR/$slug.caddy"
-			;;
-		*)
-			render_template "$TEMPLATES_DIR/_shared/caddy-site.api-web.tpl" \
-				"DOMAIN=$domain" \
-				"API_HOST=mvp-${slug}-api-1" "API_PORT=4000" \
-				"WEB_HOST=mvp-${slug}-web-1" "WEB_PORT=80" \
-				> "$SITES_DIR/$slug.caddy"
-			;;
-	esac
+	render_site "$slug" "$type" "$domain" "$app_port"
 
 	regen_projects_json
 	ok "MVP '$slug' registered."
@@ -384,6 +438,117 @@ cmd_mvp_list() {
 		( set -a; . "$m"; set +a
 		  printf '%-20s %-25s %-40s %-12s %-15s\n' "$SLUG" "$TYPE" "$DOMAIN" "${CURRENT_TAG:--}" "${DB_NAME:--}" )
 	done
+}
+
+# mvpool mvp:set-domain <slug> <domain[,domain...]> [--port N]
+#
+# Re-point an existing MVP at a new hostname WITHOUT touching its data.
+#
+# This exists because the obvious workarounds are both wrong:
+#   · `mvp:add` refuses a slug that already exists, and would not re-render
+#     the site file even if it did not;
+#   · `mvp:remove` backs up and then DROPS THE DATABASE AND ROLE. Reaching
+#     for it to change a hostname deletes every row the MVP ever stored.
+# Before this command the only route was a hand-edit of three files, which is
+# how the Faraward cutover was written up and how it would have gone wrong.
+#
+# It rewrites .meta, the domain-derived URLs in .env, and the Caddy site file,
+# then reloads Caddy. It never touches the database, the compose file or the
+# running containers.
+#
+# ⚠️ It does NOT create DNS. Records inside $MVPOOL_ARVANCLOUD_DOMAIN are
+# handled by `mvpool-local arvan:ensure`; anything else is yours to create
+# before you run this, or the new name simply will not resolve.
+#
+# ⚠️ NEXT_PUBLIC_*-style values are baked into web bundles at BUILD time and
+# cannot be fixed from here — re-point, then REBUILD, or the browser keeps
+# calling the old API host forever.
+cmd_mvp_set_domain() {
+	local slug="${1:-}" domain="${2:-}"; shift 2 2>/dev/null || true
+	[[ -n "$slug" && -n "$domain" ]] || die "usage: mvpool mvp:set-domain <slug> <domain[,domain...]> [--port N]"
+
+	local app_port=""
+	while (($#)); do
+		case "$1" in
+			--port) app_port="$2"; shift 2 ;;
+			-*) die "unknown flag: $1" ;;
+			*) die "unexpected arg: $1" ;;
+		esac
+	done
+
+	local app_dir="$APPS_DIR/$slug"
+	[[ -d "$app_dir" ]] || die "no such MVP: $slug (have: $(ls "$APPS_DIR" 2>/dev/null | tr '\n' ' '))"
+	require_infra
+	load_infra_env
+	load_mvp_meta "$slug"
+
+	local old_domain="$DOMAIN"
+	[[ -n "$app_port" ]] || app_port="${APP_PORT:-4000}"
+	[[ "$app_port" =~ ^[0-9]+$ ]] || die "--port must be a number, got '$app_port'"
+
+	# Reject a host another slug already claims — two Caddy sites on one address
+	# is a coin flip over which container answers, and it fails silently.
+	local other other_slug other_domain clash
+	clash=$(
+		for other in "$APPS_DIR"/*/.meta; do
+			[[ -f "$other" ]] || continue
+			# shellcheck disable=SC1090
+			other_slug=$(sed -n 's|^SLUG=||p' "$other")
+			other_domain=$(sed -n 's|^DOMAIN=||p' "$other")
+			[[ "$other_slug" == "$slug" ]] && continue
+			printf '%s\n' "$other_domain" | tr ',' '\n' | while read -r m; do
+				m="${m//[[:space:]]/}"
+				[[ -n "$m" ]] || continue
+				printf '%s\n' "$domain" | tr ',' '\n' | while read -r h; do
+					h="${h//[[:space:]]/}"
+					[[ -n "$h" && "$h" == "$m" ]] && echo "$h -> $other_slug"
+				done
+			done
+		done
+	)
+	[[ -z "$clash" ]] || die "host already claimed by another MVP: $clash"
+
+	local primary; primary=$(primary_host "$domain")
+
+	log "re-pointing '$slug': $old_domain  ->  $domain"
+
+	# 1. .meta — the record every other command reads.
+	sed -i "s|^DOMAIN=.*|DOMAIN=$domain|" "$app_dir/.meta"
+	if grep -q '^APP_PORT=' "$app_dir/.meta"; then
+		sed -i "s|^APP_PORT=.*|APP_PORT=$app_port|" "$app_dir/.meta"
+	else
+		printf 'APP_PORT=%s\n' "$app_port" >> "$app_dir/.meta"
+	fi
+
+	# 2. .env — DOMAIN plus the URLs derived from it. Only these four are
+	#    template-generated; anything the app added by hand is left alone,
+	#    because guessing at an app's own vars is how you break one.
+	if [[ -f "$app_dir/.env" ]]; then
+		cp "$app_dir/.env" "$app_dir/.env.bak"
+		sed -i \
+			-e "s|^DOMAIN=.*|DOMAIN=$domain|" \
+			-e "s|^PUBLIC_URL=.*|PUBLIC_URL=https://$primary|" \
+			-e "s|^API_PUBLIC_URL=.*|API_PUBLIC_URL=https://$primary|" \
+			-e "s|^WEB_ORIGIN=.*|WEB_ORIGIN=https://$primary|" \
+			"$app_dir/.env"
+		chmod 600 "$app_dir/.env"
+	fi
+
+	# 3. The Caddy site file, from the same renderer mvp:add uses.
+	[[ -f "$SITES_DIR/$slug.caddy" ]] && cp "$SITES_DIR/$slug.caddy" "$SITES_DIR/$slug.caddy.bak"
+	render_site "$slug" "$TYPE" "$domain" "$app_port"
+
+	regen_projects_json
+	cmd_infra_reload_caddy || die "Caddy refused the new config — site file is at $SITES_DIR/$slug.caddy, previous at $SITES_DIR/$slug.caddy.bak"
+
+	ok "MVP '$slug' now answers on: $(site_address "$domain")"
+	echo "  upstream:     mvp-${slug}-app-1:${app_port}"
+	echo "  .env backup:  $app_dir/.env.bak"
+	echo
+	echo "Remaining, and NOT done by this command:"
+	echo "  · DNS for each new host (A -> this pool, proxied)"
+	echo "  · a REBUILD if the app bakes its API origin in at build time"
+	echo "  · app-specific env that names the old host (CORS origins, link bases)"
 }
 
 cmd_mvp_remove() {
@@ -590,6 +755,7 @@ main() {
 		self-update)      cmd_self_update "$@" ;;
 		mvp:add)          cmd_mvp_add "$@" ;;
 		mvp:list|list)    cmd_mvp_list "$@" ;;
+		mvp:set-domain)   cmd_mvp_set_domain "$@" ;;
 		mvp:remove)       cmd_mvp_remove "$@" ;;
 		deploy)           cmd_deploy "$@" ;;
 		rollback)         cmd_rollback "$@" ;;
